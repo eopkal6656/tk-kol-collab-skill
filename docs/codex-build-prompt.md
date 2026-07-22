@@ -43,16 +43,20 @@ Users will upload a CSV or Excel file. The app must parse this based on the head
 
 The baseline columns must include:
 *   Creator username & Profile link
+*   **Channel type** (e.g., YouTube, TikTok, Instagram)
+*   **Creator tier / level** (e.g., Micro, Mid, Macro)
 *   Contact method
 *   Product & Brand
 *   Current status
-*   **Fulfillment method & status** (Shipping/Bank Transfer, mapped to Settings)
+*   Fulfillment method & status (Shipping/Bank Transfer, mapped to Settings)
+*   **Transfer / Payment account details** (e.g., PayPal/Bank Info)
+*   **Paid amount / Collaboration fee**
 *   Sample delivered date / Payment cleared date
 *   Video progress
-*   **Video posted date** (Updated from first video posted date)
-*   **Video upload time**
-*   **Collaboration count** (How many times we worked with them)
-*   **Collaborated products** (Past products they reviewed)
+*   Video posted date (Updated from first video posted date)
+*   Video upload time
+*   Collaboration count (How many times we worked with them)
+*   **Collaborated models / Past products**
 *   Last contact date & follow-up count
 *   Notes
 
