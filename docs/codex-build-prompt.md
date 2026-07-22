@@ -1,166 +1,104 @@
 # Codex Build Prompt
 
-Build a lightweight deployable web MVP for the project: TikTok Creator SOP Tool.
+Build a lightweight deployable web MVP for the project: Omni-channel KOL Collaboration Tool.
 
 ## Main Goal
 
-Create a web tool that helps TikTok Shop sellers upload a creator collaboration spreadsheet and generate a daily follow-up task list.
+Create a flexible web tool that helps KOL Promotion Specialists upload creator collaboration data, manage cross-platform outreach (YouTube/TikTok/IG), and generate daily follow-up task lists. 
 
-The MVP should focus on one core user question:
-
-Who should I follow up with today, and why?
+The MVP should accommodate multiple brands/projects and focus on this core user question:
+**Who should I follow up with today, what is their status, and what is the exact action to take?**
 
 ## Tech Requirement
 
 Please build this as a lightweight web app that can be deployed later to Vercel or Netlify.
 
 Recommended stack:
-
 * React or Next.js
 * TypeScript if possible
 * Clean and simple UI
 * No login required
-* No database required
-* No TikTok API integration required
-* Data can be processed temporarily in the browser
+* No database required (Local storage is acceptable for saving Settings)
+* No external API integration required
+* Data should be processed temporarily in the browser
 
-## Input
+## 1. Global Settings (Configuration Hub)
 
-The user should be able to upload a CSV or Excel file.
+Before processing data, the app must include a **Settings** section where users can customize their workflow. These settings must dictate how other components behave:
+*   **Brand Management:** Add/edit/delete brand names.
+*   **Database Column Configurator:** Allow users to add, edit, or remove custom table headers for the uploaded spreadsheet. 
+*   **Fulfillment Methods:** Define how samples/payments are delivered (e.g., Physical Shipping, Bank Transfer, Order Placement).
+*   **Content Review Criteria:** Define customizable checklists for content approval (e.g., Logo visibility, BGM rules).
 
-The spreadsheet columns should follow:
+## 2. Dashboard (Today's Workspace)
 
-* Creator username
-* Creator profile link
-* Contact method
-* Product
-* Current status
-* Sample shipping status
-* Sample delivered date
-* Video progress
-* First video posted date
-* Last contact date
-* Last follow-up count
-* Notes
+*   **View Toggle:** Default to an "All Work/Brands" overview. Allow users to filter the dashboard by specific custom brands defined in Settings.
+*   **Project Overview:** Display aggregate stats categorized by two dimensions: 
+    1. By Brand
+    2. By Specific Product
 
-## Core Features
+## 3. Data Input & KOL Database
 
-### 1. File Upload
+Users will upload a CSV or Excel file. The app must parse this based on the headers defined in Settings. 
 
-Allow users to upload CSV or Excel files.
+The baseline columns must include:
+*   Creator username & Profile link
+*   Contact method
+*   Product & Brand
+*   Current status
+*   **Fulfillment method & status** (Shipping/Bank Transfer, mapped to Settings)
+*   Sample delivered date / Payment cleared date
+*   Video progress
+*   **Video posted date** (Updated from first video posted date)
+*   **Video upload time**
+*   **Collaboration count** (How many times we worked with them)
+*   **Collaborated products** (Past products they reviewed)
+*   Last contact date & follow-up count
+*   Notes
 
-After upload, parse the creator data and show a clean table preview.
+## 4. Daily Task Summary & Priority Logic
 
-### 2. Daily Task Summary
+Generate a summary showing total creators and tasks broken down by priority. Priority logic based on `docs/mvp-rules.md`:
+1.  **Highest:** Fulfillment completed (delivered/transferred) but video progress is still 0.
+2.  **High:** Creator posted 1 video but has not posted the required subsequent content.
+3.  **Medium:** Followed up but no reply after 1 day.
+4.  **Low:** Contacted but no reply after 2 days.
 
-Generate a summary showing:
+*   **Highest Priority Explanation:** Provide a text breakdown for "Highest" priority creators explaining *why* they are urgent (e.g., delivery timing vs. missing video) and the suggested next action.
+*   **Failed Candidate Warning:** Flag creators based on failure rules, but require the user to manually confirm/mark them as failed.
 
-* Total creators in the uploaded file
-* Number of creators that need follow-up today
-* Number of Highest priority tasks
-* Number of High priority tasks
-* Number of Medium priority tasks
-* Number of Low priority tasks
-* Number of Failed Candidate warnings
+## 5. Message Generator
 
-### 3. Daily Task Table
+Allow the user to select one creator from the task table and choose a platform channel: **YouTube, TikTok, or Instagram**. 
 
-Generate a task table sorted by priority.
+Generate an English message, followed by a Chinese translation/explanation. 
 
-Table columns:
+**STRICT TEMPLATE RULE FOR OUTREACH:** 
+When generating outreach messages or emails, the prompt MUST strictly follow this fixed structure:
+1.  **Compliment:** Acknowledge their recent specific content.
+2.  **Purpose:** State the reason for reaching out clearly.
+3.  **Company Introduction:** Briefly introduce the brand.
+4.  **Product Introduction:** Highlight key selling points relevant to their audience.
 
-* Priority
-* Creator username
-* Product
-* Current status
-* Trigger reason
-* Suggested action
-* Contact method
-* Video progress
-* Failed candidate warning if applicable
+**STRICT SUBJECT LINE RULE:**
+All generated email subject lines MUST use this exact format: `[FIFINE Collaboration Invitation: Product Name]`
 
-### 4. Priority Logic
+## 6. Content Review Module
 
-Use the rules from `docs/mvp-rules.md`.
-
-Priority order:
-
-1. Highest: sample delivered but video progress is still 0/2
-2. High: creator posted 1 video but has not posted the second video
-3. Medium: creator was followed up but has not replied after 1 day
-4. Low: creator was contacted but has not replied after 2 days
-
-### 5. Highest Priority Explanation
-
-For all Highest priority creators, show a separate explanation section below the table.
-
-Each explanation should include:
-
-* Creator username
-* Sample delivery timing
-* Current video progress
-* Why this creator is urgent
-* Suggested next action
-
-### 6. Failed Candidate Warning
-
-Do not automatically mark creators as failed.
-
-Only show a “Failed Candidate” warning if the creator matches the rules in `docs/mvp-rules.md`.
-
-The user should still make the final decision.
-
-### 7. Message Generator
-
-Allow the user to select one creator from the task table and choose a channel:
-
-* TikTok DM
-* TikTok Shop Affiliate Message
-* Email
-* WhatsApp
-
-Then generate:
-
-1. English message first
-2. Chinese explanation below
-
-Use the tone rules from `docs/message-and-brief.md`.
-
-Do not automatically generate messages for all creators.
-
-### 8. Steam Grooming Brush Brief
-
-Include a built-in product brief template for Steam Grooming Brush based on `docs/message-and-brief.md`.
-
-The message generator should reference this brief when the product is Steam Grooming Brush.
+Allow users to select a creator whose video is ready for review and display the dynamic checklist defined in the Settings module. Allow the user to check off items before generating a final approval/revision message.
 
 ## UI Requirements
 
-Keep the interface simple.
-
-Suggested page layout:
-
-1. Header
-2. Short product description
-3. Upload area
-4. Data preview
-5. Daily task summary cards
-6. Daily task table
-7. Highest priority explanation section
-8. Failed candidate warning section
-9. Message generator section
-
-The design should feel clean, practical, and suitable for a small business operations tool.
+Keep the interface clean, practical, and modular. Suggested layout:
+1.  **Top Navigation:** Dashboard | KOL Database | Settings
+2.  **Dashboard View:** "All Brands" selector, summary cards, and Project categorizations.
+3.  **Upload Area & Data Preview** (Reflecting custom headers).
+4.  **Daily Task Table** (Sorted by priority).
+5.  **Highest Priority Action Panel**.
+6.  **Omni-channel Message Generator & Content Reviewer** (Appears when clicking a task).
 
 ## Important Notes
 
-Do not build:
-
-* Login system
-* Payment system
-* TikTok API integration
-* Database
-* Complex dashboard
-* Monthly report
-
-Focus only on the first MVP.
+*   Do NOT build a login system, backend database, or payment system.
+*   Do NOT hardcode the table headers or fulfillment methods (they must pull from Settings).
+*   Focus purely on a functional frontend MVP that processes CSV/Excel files locally and guides the specialist's daily workflow.
