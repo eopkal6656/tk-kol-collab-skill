@@ -1,0 +1,5090 @@
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type ReactNode,
+} from "react";
+import {
+  buildDuplicateImportSummary,
+  clearSavedCreatorRows,
+  copyCreatorBaseFields,
+  countActiveCreatorSamples,
+  createBlankCreatorRow,
+  deleteCreatorRow,
+  downloadCreatorRowsCsv,
+  getDuplicateCheck,
+  normalizeCreatorRowStore,
+  loadCreatorRows,
+  saveCreatorRows,
+  updateCreatorField,
+  type EditableCreatorField,
+} from "./creatorData";
+import { parseCreatorFile } from "./fileParser";
+import {
+  analyzeCreators,
+  daysSince,
+  isDeliveredLogisticsStatus,
+  isInTransitLogisticsStatus,
+  normalizeVideoProgress,
+  parseRequiredVideos,
+} from "./sopRules";
+import {
+  CHANNELS,
+  defaultCreatorFilmingRequirements,
+  generateMessage,
+  type CreatorFilmingRequirements,
+  type ReplyTone,
+} from "./messageGenerator";
+import {
+  ALL_STORES,
+  DEFAULT_STORE_ID,
+  DEFAULT_STORE_NAME,
+  campaignIdentity,
+  campaignIdFromName,
+  campaignToFilmingRequirements,
+  createCampaignFromName,
+  loadCampaigns,
+  mergeDetectedCampaigns,
+  saveCampaigns,
+  normalizeStoreId,
+  normalizeStoreName,
+} from "./campaignData";
+import type {
+  Campaign,
+  Channel,
+  CreatorRow,
+  GeneratedMessage,
+  Task,
+} from "./types";
+import "./styles.css";
+
+const FILMING_REQUIREMENTS_STORAGE_KEY = "tiktokCreatorSop.filmingRequirements";
+
+const creatorStatuses = [
+  "Not Contacted",
+  "Invited",
+  "Replied",
+  "Sample Requested",
+  "Sample Approved",
+  "Sample Shipped",
+  "Delivered",
+  "Waiting Video",
+  "Posted",
+  "Need Revision",
+  "Product Tag Missing",
+  "Ready for Ads",
+  "Spark Ads Requested",
+  "Completed",
+  "Lost",
+] as const;
+
+type CreatorStatus = (typeof creatorStatuses)[number];
+type ModuleKey =
+  | "dashboard"
+  | "creators"
+  | "templates"
+  | "samples"
+  | "followup"
+  | "review"
+  | "ads"
+  | "settings";
+type Toast = { tone: "success" | "warning"; text: string } | null;
+type DeepSeekAction = "translate_creator_reply" | "generate_personalized_reply";
+type MessageSource = "local" | "deepseek";
+type PendingDuplicateAdd = { draft: CreatorRow; existing: CreatorRow } | null;
+type WorkbenchFilterKey =
+  | "follow_up_today"
+  | "processed_today"
+  | "delivered_waiting_video"
+  | "remaining_video"
+  | "posted_this_week"
+  | "completed"
+  | "failed"
+  | "sample_shipped";
+type DeepSeekTranslateResult = { chineseTranslation: string };
+type DeepSeekGenerateResult = {
+  englishMessage: string;
+  chineseExplanation: string;
+  detectedIntent: string;
+  recommendedTrackingStatus: string;
+};
+
+type TemplateForm = {
+  creatorName: string;
+  productName: string;
+  sellingPoint: string;
+  requirement: string;
+  length: string;
+  videos: string;
+  tagRequirement: string;
+  trackingNumber: string;
+  deadline: string;
+};
+
+const emptyTemplateForm: TemplateForm = {
+  creatorName: "",
+  productName: defaultCreatorFilmingRequirements.productName,
+  sellingPoint: "",
+  requirement:
+    "Show a real pet using the product, clear unboxing/use process, CTA, and TikTok Shop product card.",
+  length: "40s+",
+  videos: "2",
+  tagRequirement: "Attach the TikTok Shop product card before publishing.",
+  trackingNumber: "",
+  deadline: "",
+};
+
+const statusLabels: Record<CreatorStatus, string> = {
+  "Not Contacted": "未联系",
+  Invited: "已邀约",
+  Replied: "已回复",
+  "Sample Requested": "申请样品",
+  "Sample Approved": "样品已通过",
+  "Sample Shipped": "样品已寄出",
+  Delivered: "样品已签收",
+  "Waiting Video": "等待视频",
+  Posted: "已发布",
+  "Need Revision": "需修改",
+  "Product Tag Missing": "未挂商品卡",
+  "Ready for Ads": "可投流",
+  "Spark Ads Requested": "已申请 Spark Ads",
+  Completed: "合作完成",
+  Lost: "合作失败",
+};
+
+const templateFieldLabels: Record<keyof TemplateForm, string> = {
+  creatorName: "达人名称",
+  productName: "产品名称",
+  sellingPoint: "产品卖点",
+  requirement: "拍摄要求",
+  length: "视频时长",
+  videos: "视频数量",
+  tagRequirement: "挂车 / Tag 要求",
+  trackingNumber: "物流单号",
+  deadline: "截止时间",
+};
+
+type TemplateMessage = {
+  name: string;
+  english: string;
+  chinese: string;
+};
+
+const navIcons: Record<ModuleKey, string> = {
+  dashboard: "⌁",
+  creators: "◌",
+  templates: "✦",
+  samples: "◇",
+  followup: "↗",
+  review: "✓",
+  ads: "◆",
+  settings: "⚙",
+};
+
+const navItems: Array<{ key: ModuleKey; label: string; helper: string }> = [
+  { key: "dashboard", label: "今日工作台", helper: "产品优先日常跟进" },
+  { key: "followup", label: "达人跟进中心", helper: "同工作台处理队列" },
+  { key: "creators", label: "达人数据库", helper: "搜索、筛选、批量更新" },
+  { key: "samples", label: "样品追踪", helper: "物流与到货跟进" },
+  { key: "templates", label: "沟通话术模板", helper: "标准英文话术库" },
+  { key: "review", label: "内容审核", helper: "视频验收清单" },
+  { key: "ads", label: "投流素材库", helper: "可投流 UGC 素材" },
+  { key: "settings", label: "设置", helper: "数据与 SOP 默认值" },
+];
+
+function loadFilmingRequirements(): CreatorFilmingRequirements {
+  if (typeof window === "undefined") return defaultCreatorFilmingRequirements;
+
+  const savedRequirements = window.localStorage.getItem(
+    FILMING_REQUIREMENTS_STORAGE_KEY,
+  );
+  if (!savedRequirements) return defaultCreatorFilmingRequirements;
+
+  try {
+    const parsedRequirements = JSON.parse(
+      savedRequirements,
+    ) as Partial<CreatorFilmingRequirements>;
+    return {
+      ...defaultCreatorFilmingRequirements,
+      ...parsedRequirements,
+      productName:
+        typeof parsedRequirements.productName === "string" &&
+        parsedRequirements.productName.trim()
+          ? parsedRequirements.productName
+          : defaultCreatorFilmingRequirements.productName,
+      requirements: Array.isArray(parsedRequirements.requirements)
+        ? parsedRequirements.requirements.filter(Boolean)
+        : defaultCreatorFilmingRequirements.requirements,
+      keyContentPoints: Array.isArray(parsedRequirements.keyContentPoints)
+        ? parsedRequirements.keyContentPoints.filter(Boolean)
+        : defaultCreatorFilmingRequirements.keyContentPoints,
+      referenceLinks: Array.isArray(parsedRequirements.referenceLinks)
+        ? parsedRequirements.referenceLinks.filter(Boolean)
+        : [],
+    };
+  } catch {
+    return defaultCreatorFilmingRequirements;
+  }
+}
+
+function saveFilmingRequirements(requirements: CreatorFilmingRequirements) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(
+    FILMING_REQUIREMENTS_STORAGE_KEY,
+    JSON.stringify(requirements),
+  );
+}
+
+function todayString() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function addDays(days: number) {
+  const date = new Date();
+  date.setDate(date.getDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function normalizeListText(value: string): string[] {
+  return value
+    .split("\n")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function listToText(value: string[] | undefined): string {
+  return (value ?? []).join("\n");
+}
+
+function displayName(row: Pick<CreatorRow, "username">): string {
+  return row.username.trim() || "未命名达人";
+}
+
+function creatorHandle(row: Pick<CreatorRow, "username">): string {
+  const name = displayName(row);
+  return name === "未命名达人" || name.startsWith("@") ? name : `@${name}`;
+}
+
+function displayStatus(status: CreatorStatus): string {
+  return statusLabels[status] ?? status;
+}
+
+function priorityLabel(task: Task): string {
+  return task.priority === "High"
+    ? "高"
+    : task.priority === "Medium"
+      ? "中"
+      : "低";
+}
+
+function compactCreatorLabel(task: Task): string {
+  return `${creatorHandle(task)} · ${priorityLabel(task)} · ${queueStatusLabelText(task)}`;
+}
+
+function queueStatusLabelText(task: Task): string {
+  if (task.trackingStatus?.trim()) return task.trackingStatus.trim();
+  if (task.priority === "Low" && task.triggerReason.includes("今日已处理"))
+    return "今日已处理";
+  if (task.priority === "Low" && task.triggerReason.includes("暂不催"))
+    return "暂不催";
+  if (task.priority === "High") return "待跟进";
+  if (task.priority === "Medium") return "轻跟进";
+  return "稍后复查";
+}
+
+function containsChinese(value: string): boolean {
+  return /[\u3400-\u9fff]/.test(value);
+}
+
+function outgoingEnglishValue(value: string, fallback: string): string {
+  const trimmed = value.trim();
+  if (!trimmed || containsChinese(trimmed)) return fallback;
+  return trimmed;
+}
+
+function safeLower(value: string | undefined) {
+  return (value ?? "").trim().toLowerCase();
+}
+
+function parseRequiredVideoCountText(value: string | undefined): number | null {
+  const trimmed = (value ?? "").trim();
+  if (!trimmed) return null;
+  if (/^\d+$/.test(trimmed)) {
+    const parsed = Number.parseInt(trimmed, 10);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+  }
+  const parsed = parseRequiredVideos(trimmed);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function campaignRequiredVideoCount(
+  campaign: Campaign,
+  fallback: CreatorFilmingRequirements,
+): number {
+  return (
+    parseRequiredVideoCountText(campaign.videoCount) ??
+    parseRequiredVideos(campaignToFilmingRequirements(campaign, fallback))
+  );
+}
+
+function normalizedProductKey(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function campaignOptionValue(campaign: Campaign): string {
+  return campaignIdentity(
+    normalizeStoreId(campaign.storeId, campaign.storeName),
+    campaign.id,
+  );
+}
+
+function campaignSelectValue(
+  campaign: Campaign,
+  campaigns: Campaign[],
+): string {
+  const sameProduct = campaigns.filter(
+    (item) => item.productName === campaign.productName,
+  );
+  return sameProduct.length === 1
+    ? campaign.productName
+    : campaignOptionValue(campaign);
+}
+
+function campaignLabel(campaign: Campaign, showStore = true): string {
+  return showStore
+    ? `${normalizeStoreName(campaign.storeName)} · ${campaign.productName}`
+    : campaign.productName;
+}
+
+function rowStoreId(row: CreatorRow): string {
+  return normalizeStoreId(row.storeId, row.storeName);
+}
+
+function rowMatchesStore(row: CreatorRow, selectedStore: string): boolean {
+  return selectedStore === ALL_STORES || rowStoreId(row) === selectedStore;
+}
+
+function rowMatchesCampaign(row: CreatorRow, campaign: Campaign): boolean {
+  if (rowStoreId(row) !== campaign.storeId) return false;
+  const rowCampaignId = row.campaignId;
+  if (rowCampaignId && rowCampaignId === campaign.id) return true;
+  return (
+    normalizedProductKey(row.product) ===
+    normalizedProductKey(campaign.productName)
+  );
+}
+
+function hasAny(value: string, terms: string[]) {
+  const normalized = safeLower(value);
+  return terms.some((term) => normalized.includes(term));
+}
+
+function isCurrentWeek(dateValue: string) {
+  if (!dateValue) return false;
+  const date = new Date(`${dateValue}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) return false;
+  const now = new Date();
+  const today = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+  );
+  const day = today.getUTCDay() || 7;
+  const weekStart = new Date(today);
+  weekStart.setUTCDate(today.getUTCDate() - day + 1);
+  const weekEnd = new Date(weekStart);
+  weekEnd.setUTCDate(weekStart.getUTCDate() + 7);
+  return date >= weekStart && date < weekEnd;
+}
+
+function videoProgressCounts(
+  row: Pick<CreatorRow, "videoProgress">,
+  requiredVideos: number,
+) {
+  const progress = normalizeVideoProgress(row.videoProgress, requiredVideos);
+  return {
+    posted: progress.postedCount ?? 0,
+    required: progress.requiredVideos ?? requiredVideos,
+  };
+}
+
+function isSampleDeliveredForVideo(row: CreatorRow, requiredVideos: number) {
+  return ["Delivered", "Waiting Video"].includes(
+    inferStatus(row, requiredVideos),
+  );
+}
+
+function isSampleInTransitForDaily(row: CreatorRow, requiredVideos: number) {
+  return inferStatus(row, requiredVideos) === "Sample Shipped";
+}
+
+function inferStatus(row: CreatorRow, requiredVideos: number): CreatorStatus {
+  const status = safeLower(row.currentStatus);
+  const shipping = safeLower(row.sampleShippingStatus);
+  const progress = normalizeVideoProgress(row.videoProgress, requiredVideos);
+  const notes = safeLower(row.notes);
+  const tracking = safeLower(row.trackingStatus);
+
+  if (
+    hasAny(status, ["lost", "failed", "cancel", "失败"]) ||
+    hasAny(tracking, ["failed", "失败"])
+  )
+    return "Lost";
+  if (
+    hasAny(status, ["completed", "complete", "已完成", "合作完成", "完成"]) ||
+    hasAny(tracking, ["completed", "合作完成", "完成"])
+  )
+    return "Completed";
+  if (hasAny(status, ["spark"])) return "Spark Ads Requested";
+  if (
+    hasAny(status, ["ready for ads"]) ||
+    hasAny(notes, ["ready for ads", "high ctr", "投流"])
+  )
+    return "Ready for Ads";
+  if (
+    hasAny(status, ["tag missing"]) ||
+    hasAny(notes, ["product tag missing", "missing product card", "未挂"])
+  )
+    return "Product Tag Missing";
+  if (hasAny(status, ["revision", "revise", "修改"])) return "Need Revision";
+  if ((progress.postedCount ?? 0) > 0 || hasAny(status, ["posted"]))
+    return "Posted";
+  if (hasAny(status, ["waiting video", "waiting for video"]))
+    return "Waiting Video";
+  if (
+    isDeliveredLogisticsStatus(row.sampleShippingStatus) ||
+    hasAny(status, [
+      "delivered",
+      "已签收",
+      "已到货",
+      "waiting video",
+      "等待视频",
+    ])
+  )
+    return "Delivered";
+  if (
+    isInTransitLogisticsStatus(row.sampleShippingStatus) ||
+    hasAny(status, ["sample shipped", "in transit", "运输中", "已发货"])
+  )
+    return "Sample Shipped";
+  if (hasAny(status, ["approved"])) return "Sample Approved";
+  if (hasAny(status, ["sample requested", "requested"]))
+    return "Sample Requested";
+  if (
+    hasAny(status, ["replied"]) ||
+    tracking === "replied" ||
+    tracking === "reply pending"
+  )
+    return "Replied";
+  if (
+    hasAny(status, ["invited", "contacted", "followed up"]) ||
+    tracking === "followed up"
+  )
+    return "Invited";
+  return "Not Contacted";
+}
+
+function statusTone(status: CreatorStatus) {
+  return `status-pill status-${status.toLowerCase().replace(/\s+/g, "-")}`;
+}
+
+function isArchivedCollaboration(
+  row: Pick<CreatorRow, "archivedAt" | "currentStatus" | "trackingStatus">,
+): boolean {
+  return Boolean(
+    row.archivedAt ||
+    hasAny(`${row.currentStatus} ${row.trackingStatus ?? ""}`, [
+      "completed",
+      "complete",
+      "已完成",
+      "合作完成",
+      "failed",
+      "lost",
+      "失败",
+      "归档",
+    ]),
+  );
+}
+
+function isActiveDailyCollaboration(
+  row: CreatorRow,
+  requiredVideos: number,
+): boolean {
+  const status = inferStatus(row, requiredVideos);
+  return (
+    !isArchivedCollaboration(row) && status !== "Completed" && status !== "Lost"
+  );
+}
+
+function parseNumberFromNotes(notes: string, keys: string[]): string {
+  for (const key of keys) {
+    const expression = new RegExp(`${key}\\s*[:：]\\s*([^,;\\n]+)`, "i");
+    const match = notes.match(expression);
+    if (match?.[1]) return match[1].trim();
+  }
+  return "—";
+}
+
+function creatorType(row: CreatorRow) {
+  return parseNumberFromNotes(row.notes, ["niche", "creator type", "type"]) ===
+    "—"
+    ? "Pet / UGC"
+    : parseNumberFromNotes(row.notes, ["niche", "creator type", "type"]);
+}
+
+function followerCount(row: CreatorRow) {
+  return parseNumberFromNotes(row.notes, [
+    "followers",
+    "follower count",
+    "粉丝",
+  ]);
+}
+
+function avgViews(row: CreatorRow) {
+  return parseNumberFromNotes(row.notes, [
+    "avg views",
+    "average views",
+    "播放",
+  ]);
+}
+
+function gmvRange(row: CreatorRow) {
+  return parseNumberFromNotes(row.notes, ["gmv", "gmv range"]);
+}
+
+function daysDelivered(row: CreatorRow) {
+  return row.sampleDeliveredDate ? daysSince(row.sampleDeliveredDate) : null;
+}
+
+function sampleHint(row: CreatorRow, requiredVideos: number) {
+  const status = inferStatus(row, requiredVideos);
+  const deliveredDays = daysDelivered(row);
+  const progress = normalizeVideoProgress(row.videoProgress, requiredVideos);
+
+  if (status === "Sample Shipped") return "已寄出但未签收：确认物流是否卡住。";
+  if (
+    status === "Delivered" &&
+    deliveredDays !== null &&
+    deliveredDays >= 5 &&
+    (progress.postedCount ?? 0) === 0
+  )
+    return "已签收 5 天未发布：催发视频并确认拍摄计划。";
+  if (status === "Delivered" && deliveredDays !== null && deliveredDays >= 3)
+    return "已签收 3 天未回复：发送签收后跟进。";
+  if (status === "Lost") return "达人取消合作：确认是否需退样。";
+  return "按下一次跟进日期复查。";
+}
+
+function buildTemplateMessages(form: TemplateForm): TemplateMessage[] {
+  const creator = outgoingEnglishValue(form.creatorName, "[Creator Name]");
+  const product = outgoingEnglishValue(form.productName, "[Product Name]");
+  const sellingPoint = outgoingEnglishValue(
+    form.sellingPoint,
+    "[Product Selling Point]",
+  );
+  const requirement = outgoingEnglishValue(
+    form.requirement,
+    "[Video Requirement]",
+  );
+  const length = outgoingEnglishValue(form.length, "[Video Length]");
+  const videos = outgoingEnglishValue(form.videos, "[Number of Videos]");
+  const tag = outgoingEnglishValue(
+    form.tagRequirement,
+    "[Product Tag Requirement]",
+  );
+  const tracking = outgoingEnglishValue(
+    form.trackingNumber,
+    "[Tracking Number]",
+  );
+  const deadline = outgoingEnglishValue(form.deadline, "[Deadline]");
+
+  return [
+    {
+      name: "初次邀约",
+      english: `Hi ${creator}, we love your pet content and would like to invite you to collaborate on ${product}. Key selling point: ${sellingPoint}. The requirement is ${videos} video(s), ${length}, with ${tag}. Are you open to receiving a sample?`,
+      chinese: `向 ${creator} 发起首次合作邀约，说明 ${product} 的核心卖点、视频数量、时长和挂车要求，并询问是否愿意收样。`,
+    },
+    {
+      name: "达人同意合作",
+      english: `Amazing, ${creator}! For ${product}, please cover: ${requirement}. Please keep each video ${length}, publish ${videos} video(s), and ${tag}. Deadline target: ${deadline}.`,
+      chinese: `达人同意合作后，确认 ${product} 的拍摄要求、视频时长、视频数量、挂车要求和目标截止时间。`,
+    },
+    {
+      name: "样品已寄出",
+      english: `Your ${product} sample has been shipped. Tracking number: ${tracking}. Once it arrives, please test it with a real pet scene and share your posting plan.`,
+      chinese: `通知达人样品已寄出，提供物流单号，并提醒签收后在真实宠物场景中测试产品、反馈发布计划。`,
+    },
+    {
+      name: "样品已签收跟进",
+      english: `Hi ${creator}, tracking shows the ${product} sample was delivered. Could you confirm you received it and let us know your filming schedule?`,
+      chinese: `物流显示已签收后，确认达人是否收到 ${product}，并推进达人给出拍摄排期。`,
+    },
+    {
+      name: "催发视频",
+      english: `Hi ${creator}, just checking in on the ${product} video(s). The target is ${videos} video(s) by ${deadline}. Please let us know if you need anything before posting.`,
+      chinese: `达人已收样但视频未发布时，提醒 ${videos} 条视频和 ${deadline} 截止时间，同时保留支持口径。`,
+    },
+    {
+      name: "提醒挂商品卡",
+      english: `Thanks for posting! One important fix: please attach the TikTok Shop product card for ${product}. ${tag}`,
+      chinese: `达人已发布但未挂商品卡时，提醒其为 ${product} 补挂 TikTok Shop 商品卡。`,
+    },
+    {
+      name: "要求修改视频",
+      english: `Thanks for the draft/post. Could you revise it to include: ${requirement}. Please also keep it ${length} and avoid unsupported claims.`,
+      chinese: `视频草稿或已发布内容不符合要求时，清楚说明需要补充的拍摄点、时长要求和合规风险。`,
+    },
+    {
+      name: "索要 Spark Ads 授权",
+      english: `This video looks strong for paid boosting. Could you grant Spark Ads authorization / ad code for the ${product} post?`,
+      chinese: `视频表现适合投流时，向达人索要 ${product} 内容的 Spark Ads 授权或广告码。`,
+    },
+    {
+      name: "合作取消",
+      english: `Understood. We will cancel this collaboration for ${product}. Please confirm no further posts will be made under this campaign.`,
+      chinese: `合作终止时，确认取消 ${product} 合作，并要求达人不要继续发布该 campaign 下的内容。`,
+    },
+    {
+      name: "要求退回样品",
+      english: `Since the collaboration is cancelled, please return the ${product} sample. We can share the return details and next steps.`,
+      chinese: `合作取消且需要追回样品时，说明需退回 ${product} 样品，并表示会提供退回信息。`,
+    },
+  ];
+}
+
+function App() {
+  const [rows, setRows] = useState<CreatorRow[]>(() => loadCreatorRows());
+  const [activeModule, setActiveModule] = useState<ModuleKey>("dashboard");
+  const [fileName, setFileName] = useState("");
+  const [error, setError] = useState("");
+  const [toast, setToast] = useState<Toast>(null);
+  const [importSummary, setImportSummary] = useState("");
+  const [pendingDuplicateAdd, setPendingDuplicateAdd] =
+    useState<PendingDuplicateAdd>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState<CreatorStatus | "All">(
+    "All",
+  );
+  const [creatorTypeFilter, setCreatorTypeFilter] = useState("All");
+  const [followerFilter, setFollowerFilter] = useState("All");
+  const [avgViewsFilter, setAvgViewsFilter] = useState("All");
+  const [gmvFilter, setGmvFilter] = useState("All");
+  const [bulkStatus, setBulkStatus] = useState<CreatorStatus>("Invited");
+  const [channel, setChannel] = useState<Channel>("TikTok DM");
+  const [selectedCreatorId, setSelectedCreatorId] = useState("");
+  const [message, setMessage] = useState<GeneratedMessage | null>(null);
+  const [messageSource, setMessageSource] = useState<MessageSource>("local");
+  const [trackingStatus, setTrackingStatus] = useState("");
+  const [templateCreatorId, setTemplateCreatorId] = useState("");
+  const [followupSearch, setFollowupSearch] = useState("");
+  const [followupUrgency, setFollowupUrgency] = useState<
+    "All" | "High" | "Medium" | "Low"
+  >("All");
+  const [replyFocus, setReplyFocus] = useState("");
+  const [replyRelationshipNote, setReplyRelationshipNote] = useState("");
+  const [replyTone, setReplyTone] = useState<ReplyTone>("中立专业");
+  const [replyGoal, setReplyGoal] = useState("");
+  const [replyConcession, setReplyConcession] = useState("");
+  const [templateForm, setTemplateForm] = useState<TemplateForm>(
+    () => emptyTemplateForm,
+  );
+  const [filmingRequirements, setFilmingRequirements] =
+    useState<CreatorFilmingRequirements>(() => loadFilmingRequirements());
+  const [campaigns, setCampaigns] = useState<Campaign[]>(() => loadCampaigns());
+  const [selectedStore, setSelectedStore] = useState(ALL_STORES);
+  const [selectedCampaign, setSelectedCampaign] = useState("ALL");
+  const [isEditingFilmingRequirements, setIsEditingFilmingRequirements] =
+    useState(false);
+  const [filmingProductNameDraft, setFilmingProductNameDraft] = useState(
+    () => defaultCreatorFilmingRequirements.productName,
+  );
+  const [filmingRequirementsDraft, setFilmingRequirementsDraft] = useState(() =>
+    listToText(defaultCreatorFilmingRequirements.requirements),
+  );
+  const [keyContentPointsDraft, setKeyContentPointsDraft] = useState(() =>
+    listToText(defaultCreatorFilmingRequirements.keyContentPoints),
+  );
+  const [referenceLinksDraft, setReferenceLinksDraft] = useState(() =>
+    listToText(defaultCreatorFilmingRequirements.referenceLinks),
+  );
+  const [isPromptHelperOpen, setIsPromptHelperOpen] = useState(false);
+  const [promptHelperForm, setPromptHelperForm] = useState({
+    sellingPoints: "",
+    videoCount: "",
+    durationRequirement: "",
+    targetPetOrScene: "",
+    mustShowShots: "",
+    avoidShots: "",
+    referenceLinks: "",
+  });
+  const [generatedChatGptPrompt, setGeneratedChatGptPrompt] = useState("");
+  const [promptCopyStatus, setPromptCopyStatus] = useState("");
+  const [deepSeekLoadingAction, setDeepSeekLoadingAction] =
+    useState<DeepSeekAction | null>(null);
+  const [deepSeekError, setDeepSeekError] = useState("");
+  const [deepSeekChineseTranslation, setDeepSeekChineseTranslation] =
+    useState("");
+  const [deepSeekDetectedIntent, setDeepSeekDetectedIntent] = useState("");
+  const [deepSeekChineseExplanation, setDeepSeekChineseExplanation] =
+    useState("");
+  const [
+    deepSeekRecommendedTrackingStatus,
+    setDeepSeekRecommendedTrackingStatus,
+  ] = useState("");
+  const [workbenchFilter, setWorkbenchFilter] = useState<{
+    key: WorkbenchFilterKey;
+    label: string;
+  } | null>(null);
+  const [editedCreatorReplies, setEditedCreatorReplies] = useState<
+    Record<string, string>
+  >({});
+  const [isTranslationExpanded, setIsTranslationExpanded] = useState(false);
+  const [isTranslationEditing, setIsTranslationEditing] = useState(false);
+  const [isQueueExpanded, setIsQueueExpanded] = useState(true);
+  const [onlyCurrentCreator, setOnlyCurrentCreator] = useState(false);
+  const [isAdvancedReplyOpen, setIsAdvancedReplyOpen] = useState(false);
+  const [showNextCreatorPrompt, setShowNextCreatorPrompt] = useState(false);
+  const [showProcessedToday, setShowProcessedToday] = useState(false);
+  const [showArchivedCollaborations, setShowArchivedCollaborations] =
+    useState(false);
+  const [showArchivedProducts, setShowArchivedProducts] = useState(false);
+  const [creatorSearchStatus, setCreatorSearchStatus] = useState("");
+  const [lastProcessingResult, setLastProcessingResult] = useState("");
+  const queueRef = useRef<HTMLElement | null>(null);
+  const currentCreatorRef = useRef<HTMLDivElement | null>(null);
+  const messageAreaRef = useRef<HTMLDivElement | null>(null);
+
+  const mergedCampaigns = useMemo(
+    () =>
+      mergeDetectedCampaigns(
+        campaigns,
+        rows.map(normalizeCreatorRowStore),
+        filmingRequirements,
+      ),
+    [campaigns, rows, filmingRequirements],
+  );
+  const stores = useMemo(() => {
+    const byId = new Map<string, string>();
+    rows.forEach((row) => {
+      const id = rowStoreId(row);
+      if (!byId.has(id)) byId.set(id, normalizeStoreName(row.storeName));
+    });
+    mergedCampaigns.forEach((campaign) => {
+      if (campaign.archivedAt && !showArchivedProducts) return;
+      const id = normalizeStoreId(campaign.storeId, campaign.storeName);
+      const name = normalizeStoreName(campaign.storeName);
+      if (!byId.has(id) || byId.get(id) === DEFAULT_STORE_NAME)
+        byId.set(id, name);
+    });
+    if (byId.size === 0) byId.set(DEFAULT_STORE_ID, DEFAULT_STORE_NAME);
+    return Array.from(byId, ([id, name]) => ({ id, name })).sort((a, b) =>
+      a.name.localeCompare(b.name),
+    );
+  }, [rows, mergedCampaigns, showArchivedProducts]);
+  const storeFilteredCampaigns = useMemo(
+    () =>
+      mergedCampaigns.filter(
+        (campaign) =>
+          selectedStore === ALL_STORES ||
+          normalizeStoreId(campaign.storeId, campaign.storeName) ===
+            selectedStore,
+      ),
+    [mergedCampaigns, selectedStore],
+  );
+  const activeCampaigns = useMemo(
+    () =>
+      storeFilteredCampaigns.filter(
+        (campaign) => showArchivedProducts || !campaign.archivedAt,
+      ),
+    [storeFilteredCampaigns, showArchivedProducts],
+  );
+  const showStoreLabels =
+    selectedStore === ALL_STORES &&
+    stores.some((store) => store.name !== DEFAULT_STORE_NAME);
+  const activeCampaign =
+    selectedCampaign === "ALL"
+      ? undefined
+      : (activeCampaigns.find(
+          (campaign) => campaignOptionValue(campaign) === selectedCampaign,
+        ) ??
+        activeCampaigns.find(
+          (campaign) => campaign.productName === selectedCampaign,
+        ) ??
+        mergedCampaigns.find(
+          (campaign) => campaignOptionValue(campaign) === selectedCampaign,
+        ));
+  const activeFilmingRequirements = useMemo(
+    () => campaignToFilmingRequirements(activeCampaign, filmingRequirements),
+    [activeCampaign, filmingRequirements],
+  );
+  const requiredVideos = useMemo(
+    () => parseRequiredVideos(activeFilmingRequirements),
+    [activeFilmingRequirements],
+  );
+  const visibleRows = useMemo(
+    () =>
+      selectedCampaign === "ALL"
+        ? rows.filter(
+            (row) =>
+              rowMatchesStore(row, selectedStore) &&
+              (showArchivedCollaborations || !isArchivedCollaboration(row)) &&
+              (showArchivedProducts || !campaignForRow(row)?.archivedAt),
+          )
+        : rows.filter((row) =>
+            activeCampaign
+              ? rowMatchesCampaign(row, activeCampaign) &&
+                (showArchivedCollaborations || !isArchivedCollaboration(row))
+              : false,
+          ),
+    [
+      rows,
+      selectedStore,
+      selectedCampaign,
+      activeCampaign,
+      showArchivedCollaborations,
+      showArchivedProducts,
+      mergedCampaigns,
+    ],
+  );
+  const dailyQueueRows = useMemo(
+    () =>
+      visibleRows.filter((row) =>
+        isActiveDailyCollaboration(row, requiredVideosForProduct(row.product)),
+      ),
+    [visibleRows, mergedCampaigns, activeFilmingRequirements],
+  );
+  const tasks = useMemo(
+    () => analyzeCreators(dailyQueueRows, undefined, requiredVideos),
+    [dailyQueueRows, requiredVideos],
+  );
+  const tasksById = useMemo(
+    () => new Map(tasks.map((task) => [task.id, task])),
+    [tasks],
+  );
+  const activeSampleCounts = useMemo(
+    () =>
+      new Map(
+        rows.map((row) => [row.id, countActiveCreatorSamples(row, rows)]),
+      ),
+    [rows],
+  );
+  const matchesWorkbenchFilter = (task: Task, key: WorkbenchFilterKey) => {
+    const status = inferStatus(task, requiredVideos);
+    const taskMeta = tasksById.get(task.id);
+    const progress = normalizeVideoProgress(task.videoProgress, requiredVideos);
+    switch (key) {
+      case "follow_up_today":
+        return (
+          Boolean(taskMeta?.needsFollowUp || task.needsFollowUp) &&
+          !isHandledToday(task)
+        );
+      case "processed_today":
+        return isHandledToday(task);
+      case "sample_shipped":
+        return isSampleInTransitForDaily(task, requiredVideos);
+      case "delivered_waiting_video":
+        return (
+          isSampleDeliveredForVideo(task, requiredVideos) &&
+          (progress.postedCount ?? 0) === 0
+        );
+      case "remaining_video":
+        return (
+          (progress.postedCount ?? 0) > 0 &&
+          (progress.postedCount ?? 0) <
+            (progress.requiredVideos ?? requiredVideos)
+        );
+      case "posted_this_week":
+        return (
+          isCurrentWeek(task.firstVideoPostedDate) ||
+          isCurrentWeek(task.latestVideoPostedDate ?? "")
+        );
+      case "completed":
+        return status === "Completed";
+      case "failed":
+        return status === "Lost";
+      default:
+        return true;
+    }
+  };
+  function isHandledToday(task: Task) {
+    const today = todayString();
+    const handledActions = [
+      "Message Sent",
+      "No Reply",
+      "Skipped Today",
+      "Creator Replied",
+      "Video Posted",
+      "Completed",
+      "Failed",
+    ];
+    return (
+      task.lastHandledDate === today ||
+      task.lastMessageSentAt === today ||
+      task.followUpHistory?.some(
+        (entry) =>
+          entry.date === today && handledActions.includes(entry.action),
+      )
+    );
+  }
+
+  function queueStatusLabel(task: Task) {
+    const handledToday = isHandledToday(task);
+    const latestTodayEntry = task.followUpHistory
+      ?.slice()
+      .reverse()
+      .find((entry) => entry.date === todayString());
+    if (handledToday && latestTodayEntry?.action === "No Reply") {
+      return `今日已处理 · 未回复 · 明日再跟进`;
+    }
+    if (handledToday && latestTodayEntry?.action === "Skipped Today") {
+      const note = latestTodayEntry.note
+        ?.replace(/^今日暂不跟进。?/, "")
+        .trim();
+      return `今日已处理 · 今日已跳过${note ? ` · ${note}` : ""}`;
+    }
+    if (handledToday && task.trackingStatus)
+      return `今日已处理 · ${task.trackingStatus}`;
+    if (task.trackingStatus) return task.trackingStatus;
+    return priorityLabel(task);
+  }
+
+  const filteredTasks = useMemo(() => {
+    const normalized = followupSearch.trim().toLowerCase();
+    return tasks
+      .filter((task) => {
+        const urgencyLabel =
+          task.priority === "High"
+            ? "高"
+            : task.priority === "Medium"
+              ? "中"
+              : "低";
+        const haystack = [
+          task.username,
+          task.profileLink,
+          task.storeName,
+          task.product,
+          task.currentStatus,
+          task.sampleShippingStatus,
+          task.suggestedAction,
+          task.triggerReason,
+          task.trackingStatus ?? "",
+          task.notes,
+          urgencyLabel,
+        ]
+          .join(" ")
+          .toLowerCase();
+        return (
+          (showProcessedToday || !isHandledToday(task)) &&
+          (!workbenchFilter ||
+            matchesWorkbenchFilter(task, workbenchFilter.key)) &&
+          (followupUrgency === "All" || task.priority === followupUrgency) &&
+          (!normalized || haystack.includes(normalized))
+        );
+      })
+      .sort(
+        (a, b) => a.stageRank - b.stageRank || a.priorityRank - b.priorityRank,
+      );
+  }, [
+    tasks,
+    followupSearch,
+    followupUrgency,
+    workbenchFilter,
+    requiredVideos,
+    tasksById,
+    showProcessedToday,
+  ]);
+  const selectedTask =
+    (selectedCreatorId &&
+      tasks.find((task) => task.id === selectedCreatorId)) ||
+    filteredTasks[0];
+  const selectedTemplateCreator =
+    visibleRows.find((row) => row.id === templateCreatorId) ??
+    visibleRows.find((row) => row.id === selectedCreatorId);
+
+  const currentTaskIndex = selectedTask
+    ? filteredTasks.findIndex((task) => task.id === selectedTask.id)
+    : -1;
+  const nextTask =
+    currentTaskIndex >= 0
+      ? filteredTasks.find(
+          (task, index) =>
+            index > currentTaskIndex && task.id !== selectedTask?.id,
+        )
+      : filteredTasks[0];
+
+  function scrollToQueue() {
+    window.requestAnimationFrame(() =>
+      queueRef.current?.scrollIntoView?.({
+        behavior: "smooth",
+        block: "start",
+      }),
+    );
+  }
+
+  function scrollToCurrentCreator() {
+    window.requestAnimationFrame(() =>
+      currentCreatorRef.current?.scrollIntoView?.({
+        behavior: "smooth",
+        block: "start",
+      }),
+    );
+  }
+
+  function scrollToMessageArea() {
+    window.requestAnimationFrame(() =>
+      (messageAreaRef.current ?? currentCreatorRef.current)?.scrollIntoView?.({
+        behavior: "smooth",
+        block: "start",
+      }),
+    );
+  }
+
+  function handleSelectCreator(creatorId: string) {
+    setSelectedCreatorId(creatorId);
+    setIsQueueExpanded(false);
+    setShowNextCreatorPrompt(false);
+    setDeepSeekError("");
+    setDeepSeekChineseTranslation("");
+    setDeepSeekChineseExplanation("");
+    setDeepSeekDetectedIntent("");
+    setDeepSeekRecommendedTrackingStatus("");
+    setIsTranslationEditing(false);
+    setMessageSource("local");
+    const selected = tasks.find((task) => task.id === creatorId);
+    setMessage(selected ? buildLocalMessageForTask(selected) : null);
+    scrollToCurrentCreator();
+  }
+
+  function handleProcessNextCreator() {
+    if (!nextTask) {
+      setTrackingStatus("当前筛选下暂无更多待处理达人。");
+      setLastProcessingResult("当前筛选下暂无更多待处理达人。");
+      return;
+    }
+    setMessageSource("local");
+    setTrackingStatus("");
+    setLastProcessingResult("");
+    setShowNextCreatorPrompt(false);
+    setIsQueueExpanded(false);
+    handleSelectCreator(nextTask.id);
+  }
+  const templateMessages = useMemo(
+    () => buildTemplateMessages(templateForm),
+    [templateForm],
+  );
+
+  useEffect(() => saveCreatorRows(rows), [rows]);
+
+  useEffect(() => {
+    const today = todayString();
+    const specialStatus =
+      /lost|returned|canceled|failed|completed|合作失败|合作完成|已归档/i;
+    setRows((currentRows) => {
+      let changed = false;
+      const nextRows = currentRows.map((row) => {
+        if (
+          row.archivedAt ||
+          specialStatus.test(
+            `${row.currentStatus} ${row.sampleShippingStatus} ${row.trackingStatus ?? ""}`,
+          )
+        )
+          return row;
+        if (
+          !isInTransitLogisticsStatus(row.sampleShippingStatus) ||
+          !row.sampleDeliveredDate ||
+          row.sampleDeliveredDate > today
+        )
+          return row;
+        changed = true;
+        return {
+          ...row,
+          sampleShippingStatus: row.sampleShippingStatus.match(/[㐀-鿿]/)
+            ? "已签收"
+            : "Delivered",
+          currentStatus: "Delivered",
+          trackingStatus: "确认样品是否收到 / 确认拍摄计划",
+          lastMessageScenario: "确认样品是否收到 / 确认拍摄计划",
+          nextFollowUpDate: today,
+          followUpHistory: [
+            ...(row.followUpHistory ?? []),
+            {
+              date: today,
+              action: "Creator Replied" as const,
+              note: "系统根据样品到货日期自动更新为 Delivered。",
+            },
+          ],
+        };
+      });
+      return changed ? nextRows : currentRows;
+    });
+  }, []);
+
+  useEffect(() => saveCampaigns(mergedCampaigns), [mergedCampaigns]);
+  useEffect(() => {
+    if (
+      selectedStore !== ALL_STORES &&
+      !stores.some((store) => store.id === selectedStore)
+    ) {
+      setSelectedStore(stores[0]?.id ?? ALL_STORES);
+      setSelectedCampaign("ALL");
+      setToast({ tone: "warning", text: "当前店铺不存在，已切换到可用店铺。" });
+      return;
+    }
+    if (
+      selectedCampaign !== "ALL" &&
+      !activeCampaigns.some(
+        (campaign) =>
+          campaignOptionValue(campaign) === selectedCampaign ||
+          campaign.productName === selectedCampaign,
+      )
+    ) {
+      setSelectedCampaign("ALL");
+      setToast({
+        tone: "warning",
+        text: "当前产品项目不存在或不属于当前店铺，已切换到全部产品。",
+      });
+    }
+  }, [activeCampaigns, selectedCampaign, selectedStore, stores]);
+  useEffect(() => {
+    const target = activeCampaign ?? mergedCampaigns[0];
+    if (!target) return;
+    setTemplateForm((form) => ({
+      ...form,
+      productName: target.productName,
+      sellingPoint: target.sellingPoints,
+      requirement: target.keyContentPoints.filter(Boolean).join("; "),
+      length: target.videoLength || form.length,
+      videos:
+        target.videoCount ||
+        String(
+          parseRequiredVideos(
+            campaignToFilmingRequirements(target, filmingRequirements),
+          ),
+        ),
+      tagRequirement:
+        [target.tagRequirement, target.productLink]
+          .filter(Boolean)
+          .join("; ") || form.tagRequirement,
+    }));
+  }, [activeCampaign, mergedCampaigns, filmingRequirements]);
+
+  useEffect(() => {
+    if (!selectedTemplateCreator) return;
+    const creatorCampaign = campaignForRow(selectedTemplateCreator);
+    const creatorRequirements = campaignToFilmingRequirements(
+      creatorCampaign,
+      activeFilmingRequirements,
+    );
+    setTemplateForm((form) => ({
+      ...form,
+      creatorName: selectedTemplateCreator.username || form.creatorName,
+      productName:
+        selectedTemplateCreator.product || creatorRequirements.productName,
+      sellingPoint: creatorRequirements.sellingPoints || form.sellingPoint,
+      requirement: creatorRequirements.requiredScenes || form.requirement,
+      length: creatorRequirements.videoLength || form.length,
+      videos:
+        creatorRequirements.videoCount ||
+        String(parseRequiredVideos(creatorRequirements)),
+      tagRequirement:
+        creatorRequirements.productLinkRequirement || form.tagRequirement,
+      trackingNumber:
+        parseNumberFromNotes(selectedTemplateCreator.notes, [
+          "tracking",
+          "tracking number",
+        ]) === "—"
+          ? form.trackingNumber
+          : parseNumberFromNotes(selectedTemplateCreator.notes, [
+              "tracking",
+              "tracking number",
+            ]),
+      deadline: selectedTemplateCreator.nextFollowUpDate || form.deadline,
+    }));
+  }, [selectedTemplateCreator, mergedCampaigns, activeFilmingRequirements]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 2600);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
+  const databaseRows = useMemo(
+    () =>
+      selectedCampaign === "ALL"
+        ? rows.filter(
+            (row) =>
+              rowMatchesStore(row, selectedStore) &&
+              (showArchivedProducts || !campaignForRow(row)?.archivedAt),
+          )
+        : rows.filter((row) =>
+            activeCampaign ? rowMatchesCampaign(row, activeCampaign) : false,
+          ),
+    [
+      rows,
+      selectedStore,
+      selectedCampaign,
+      activeCampaign,
+      showArchivedProducts,
+      mergedCampaigns,
+    ],
+  );
+  const productTotalCount = databaseRows.length;
+  const archivedProductCount = databaseRows.filter(
+    isArchivedCollaboration,
+  ).length;
+  const databaseVisibleRows = useMemo(
+    () =>
+      databaseRows.filter(
+        (row) => showArchivedCollaborations || !isArchivedCollaboration(row),
+      ),
+    [databaseRows, showArchivedCollaborations],
+  );
+
+  const enrichedRows = useMemo(
+    () =>
+      databaseVisibleRows.map((row) => ({
+        row,
+        task: tasksById.get(row.id),
+        status: inferStatus(row, requiredVideosForProduct(row.product)),
+        creatorType: creatorType(row),
+        followers: followerCount(row),
+        avgViews: avgViews(row),
+        gmv: gmvRange(row),
+      })),
+    [
+      databaseVisibleRows,
+      tasksById,
+      mergedCampaigns,
+      activeFilmingRequirements,
+    ],
+  );
+
+  const archivedSearchMatches = useMemo(() => {
+    const normalized = search.trim().toLowerCase();
+    if (!normalized || showArchivedCollaborations) return [];
+    return databaseRows.filter((row) => {
+      if (!isArchivedCollaboration(row)) return false;
+      return [
+        row.username,
+        row.profileLink,
+        row.product,
+        row.currentStatus,
+        row.sampleShippingStatus,
+        row.notes,
+        row.trackingStatus ?? "",
+      ]
+        .join(" ")
+        .toLowerCase()
+        .includes(normalized);
+    });
+  }, [databaseRows, search, showArchivedCollaborations]);
+
+  const filteredRows = useMemo(() => {
+    const normalized = search.trim().toLowerCase();
+    return enrichedRows.filter((entry) => {
+      const haystack = [
+        entry.row.username,
+        entry.row.profileLink,
+        entry.row.storeName,
+        entry.row.product,
+        entry.row.currentStatus,
+        entry.row.sampleShippingStatus,
+        entry.row.notes,
+        entry.status,
+      ]
+        .join(" ")
+        .toLowerCase();
+      return (
+        (!normalized || haystack.includes(normalized)) &&
+        (statusFilter === "All" || entry.status === statusFilter) &&
+        (creatorTypeFilter === "All" ||
+          entry.creatorType
+            .toLowerCase()
+            .includes(creatorTypeFilter.toLowerCase())) &&
+        (followerFilter === "All" ||
+          entry.followers.includes(followerFilter)) &&
+        (avgViewsFilter === "All" || entry.avgViews.includes(avgViewsFilter)) &&
+        (gmvFilter === "All" ||
+          entry.gmv.toLowerCase().includes(gmvFilter.toLowerCase()))
+      );
+    });
+  }, [
+    enrichedRows,
+    search,
+    statusFilter,
+    creatorTypeFilter,
+    followerFilter,
+    avgViewsFilter,
+    gmvFilter,
+  ]);
+
+  const todayTodo = useMemo(
+    () =>
+      tasks
+        .filter(
+          (task) =>
+            task.needsFollowUp ||
+            task.failedWarnings.length > 0 ||
+            inferStatus(task, requiredVideos) === "Product Tag Missing" ||
+            inferStatus(task, requiredVideos) === "Ready for Ads",
+        )
+        .sort(
+          (a, b) =>
+            a.stageRank - b.stageRank || a.priorityRank - b.priorityRank,
+        )
+        .slice(0, 12),
+    [tasks, requiredVideos],
+  );
+
+  const processedTodayCount = tasks.filter((task) =>
+    isHandledToday(task),
+  ).length;
+  const pendingFollowUpCount = tasks.filter(
+    (task) => task.needsFollowUp && !isHandledToday(task),
+  ).length;
+
+  const activeEnrichedRows = enrichedRows.filter((entry) =>
+    isActiveDailyCollaboration(
+      entry.row,
+      requiredVideosForProduct(entry.row.product),
+    ),
+  );
+
+  const deliveredWaitingVideoCount = activeEnrichedRows.filter((entry) => {
+    const rowRequiredVideos = requiredVideosForProduct(entry.row.product);
+    const { posted } = videoProgressCounts(entry.row, rowRequiredVideos);
+    return (
+      isSampleDeliveredForVideo(entry.row, rowRequiredVideos) && posted === 0
+    );
+  }).length;
+  const postedVideoCount = activeEnrichedRows.reduce(
+    (sum, entry) =>
+      sum +
+      videoProgressCounts(
+        entry.row,
+        requiredVideosForProduct(entry.row.product),
+      ).posted,
+    0,
+  );
+  const postedThisWeekCount = activeEnrichedRows.reduce((count, entry) => {
+    const dateSet = new Set(
+      [
+        entry.row.firstVideoPostedDate,
+        entry.row.latestVideoPostedDate ?? "",
+      ].filter((date) => date && isCurrentWeek(date)),
+    );
+    return count + dateSet.size;
+  }, 0);
+
+  const dashboardCards: Array<{
+    label: string;
+    value: number;
+    filterKey: WorkbenchFilterKey;
+  }> = [
+    {
+      label: "今日待跟进达人数量",
+      value: pendingFollowUpCount,
+      filterKey: "follow_up_today",
+    },
+    {
+      label: "今日已处理达人人数",
+      value: processedTodayCount,
+      filterKey: "processed_today",
+    },
+    {
+      label: "已签收待发视频数量",
+      value: deliveredWaitingVideoCount,
+      filterKey: "delivered_waiting_video",
+    },
+    {
+      label: "已发布视频数量",
+      value: postedVideoCount,
+      filterKey: "remaining_video",
+    },
+    {
+      label: "本周发布数量",
+      value: postedThisWeekCount,
+      filterKey: "posted_this_week",
+    },
+    {
+      label: "合作完成数量",
+      value: databaseRows.filter(
+        (row) =>
+          inferStatus(row, requiredVideosForProduct(row.product)) ===
+          "Completed",
+      ).length,
+      filterKey: "completed",
+    },
+    {
+      label: "合作失败数量",
+      value: databaseRows.filter(
+        (row) =>
+          inferStatus(row, requiredVideosForProduct(row.product)) === "Lost",
+      ).length,
+      filterKey: "failed",
+    },
+    {
+      label: "样品运输中数量",
+      value: activeEnrichedRows.filter((entry) =>
+        isSampleInTransitForDaily(entry.row, requiredVideos),
+      ).length,
+      filterKey: "sample_shipped",
+    },
+  ];
+
+  async function handleFile(file: File | undefined) {
+    if (!file) return;
+    try {
+      setError("");
+      const parsedRows = await parseCreatorFile(
+        file,
+        requiredVideos,
+        selectedStore === ALL_STORES
+          ? "未分配店铺"
+          : (stores.find((store) => store.id === selectedStore)?.name ??
+              DEFAULT_STORE_NAME),
+      );
+      const summary = buildDuplicateImportSummary(parsedRows, rows);
+      const summaryText = `检测到 ${summary.possibleDuplicateCount} 个可能重复达人；检测到 ${summary.multiSampleCount} 个同达人多样品记录。`;
+      setRows((currentRows) => [...parsedRows, ...currentRows]);
+      setImportSummary(summaryText);
+      setFileName(file.name);
+      setSelectedIds([]);
+      setToast({
+        tone: "success",
+        text: `导入成功，已追加 ${parsedRows.length} 条记录。${summaryText}`,
+      });
+      if (parsedRows.length === 0)
+        setError("没有找到达人数据。请检查表头和表格内容。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "无法解析该文件。");
+    }
+  }
+
+  function updateRow(
+    rowId: string,
+    field: EditableCreatorField,
+    value: string,
+  ) {
+    setRows((currentRows) =>
+      currentRows.map((row) => {
+        if (row.id !== rowId) return row;
+        let updated = updateCreatorField(row, field, value, requiredVideos);
+        if (field === "storeName") {
+          const storeName = normalizeStoreName(value);
+          updated = {
+            ...updated,
+            storeName,
+            storeId: normalizeStoreId(undefined, storeName),
+          };
+        }
+        if (field === "product") {
+          const newRequirement = parseRequiredVideos(
+            campaignToFilmingRequirements(
+              mergedCampaigns.find((campaign) =>
+                rowMatchesCampaign({ ...updated, product: value }, campaign),
+              ),
+              filmingRequirements,
+            ),
+          );
+          const progress = normalizeVideoProgress(
+            row.videoProgress,
+            requiredVideos,
+          );
+          if ((progress.postedCount ?? 0) === 0) {
+            updated = {
+              ...updated,
+              videoProgress: `0/${newRequirement}`,
+              videoProgressWarning: undefined,
+            };
+          } else if (
+            window.confirm(
+              "当前达人已有视频进度，是否根据新产品要求更新视频数量？",
+            )
+          ) {
+            updated = {
+              ...updated,
+              videoProgress: `${progress.postedCount}/${newRequirement}`,
+              videoProgressWarning: undefined,
+            };
+          }
+        }
+        if (
+          field === "username" ||
+          field === "profileLink" ||
+          field === "product"
+        ) {
+          const duplicate = getDuplicateCheck(updated, currentRows);
+          if (duplicate.possibleDuplicate) {
+            setToast({
+              tone: "warning",
+              text: "该达人在当前店铺的同一产品项目下可能已重复录入，建议检查是否需要合并。",
+            });
+          } else if (duplicate.duplicateCreator) {
+            setToast({
+              tone: "warning",
+              text: duplicate.crossStoreCreator
+                ? "跨店铺达人：该达人在其他店铺也有合作记录，请确认本次沟通是否需要区分店铺。"
+                : "同店铺多样品：该达人在当前店铺有不同产品合作，可继续保存。",
+            });
+          }
+        }
+        return updated;
+      }),
+    );
+    setMessage(null);
+    setMessageSource("local");
+  }
+
+  function handleDashboardCardClick(card: (typeof dashboardCards)[number]) {
+    setActiveModule("dashboard");
+    setWorkbenchFilter({ key: card.filterKey, label: card.label });
+    setFollowupSearch("");
+    setFollowupUrgency("All");
+    setShowProcessedToday(card.filterKey === "processed_today");
+    setOnlyCurrentCreator(false);
+    setIsQueueExpanded(true);
+    const firstMatch = tasks.find((task) =>
+      matchesWorkbenchFilter(task, card.filterKey),
+    );
+    setSelectedCreatorId(firstMatch?.id ?? "");
+    setMessage(firstMatch ? buildLocalMessageForTask(firstMatch) : null);
+    setMessageSource("local");
+    setShowNextCreatorPrompt(false);
+    scrollToQueue();
+  }
+
+  function ensureCampaign(
+    productName: string,
+    storeId: string,
+    storeName: string,
+  ) {
+    if (
+      !mergedCampaigns.some(
+        (campaign) =>
+          normalizeStoreId(campaign.storeId, campaign.storeName) === storeId &&
+          campaign.productName === productName,
+      )
+    ) {
+      setCampaigns((current) => [
+        ...current,
+        createCampaignFromName(
+          productName,
+          filmingRequirements,
+          storeName,
+          storeId,
+        ),
+      ]);
+    }
+  }
+
+  function addCreatorDraft(draft: CreatorRow, copyBaseFrom?: CreatorRow) {
+    const newRow = copyBaseFrom
+      ? copyCreatorBaseFields(draft, copyBaseFrom)
+      : draft;
+    ensureCampaign(
+      newRow.product,
+      normalizeStoreId(newRow.storeId, newRow.storeName),
+      normalizeStoreName(newRow.storeName),
+    );
+    setRows((currentRows) => [newRow, ...currentRows]);
+    setSelectedCreatorId(newRow.id);
+    setActiveModule("creators");
+    setPendingDuplicateAdd(null);
+    setToast({ tone: "success", text: "已新增达人，可直接编辑表格字段。" });
+  }
+
+  function handleAddCreator() {
+    const creatorName =
+      window.prompt("达人账号（可留空后在表格中填写）：", "")?.trim() ?? "";
+    let draftStore =
+      selectedStore === ALL_STORES
+        ? undefined
+        : stores.find((store) => store.id === selectedStore);
+
+    if (!draftStore) {
+      if (stores.length === 1) {
+        draftStore = stores[0];
+      } else {
+        const storeChoice = window
+          .prompt(
+            `请选择店铺/品牌后再新增达人：${stores.map((store) => store.name).join(" / ")}`,
+            "",
+          )
+          ?.trim();
+        draftStore = stores.find(
+          (store) =>
+            store.id === storeChoice ||
+            store.name.toLowerCase() === (storeChoice ?? "").toLowerCase(),
+        );
+        if (!draftStore) {
+          setToast({ tone: "warning", text: "请选择店铺/品牌后再新增达人" });
+          setActiveModule("creators");
+          return;
+        }
+      }
+    }
+
+    const storeId = draftStore.id;
+    const storeName = draftStore.name;
+    const storeCampaigns = mergedCampaigns.filter(
+      (campaign) =>
+        normalizeStoreId(campaign.storeId, campaign.storeName) === storeId &&
+        (showArchivedProducts || !campaign.archivedAt),
+    );
+    const defaultProduct =
+      activeCampaign &&
+      normalizeStoreId(activeCampaign.storeId, activeCampaign.storeName) ===
+        storeId
+        ? activeCampaign.productName
+        : (storeCampaigns[0]?.productName ?? filmingRequirements.productName);
+    const choice = window.prompt(
+      `所属产品（仅限 ${storeName}；同达人多样品时必须填写不同产品 / 样品项目）：`,
+      defaultProduct,
+    );
+    const productName = choice?.trim() || defaultProduct;
+    const matchedCampaign = storeCampaigns.find(
+      (campaign) => campaign.productName === productName,
+    );
+    const productRequirement = parseRequiredVideos(
+      campaignToFilmingRequirements(matchedCampaign, filmingRequirements),
+    );
+    const draft = {
+      ...createBlankCreatorRow(
+        productName,
+        productRequirement,
+        storeId,
+        storeName,
+      ),
+      username: creatorName,
+      campaignId: matchedCampaign?.id ?? campaignIdFromName(productName),
+    };
+    const duplicate = getDuplicateCheck(draft, rows);
+    if (creatorName && duplicate.duplicateCreator && duplicate.matchingRows[0]) {
+      setPendingDuplicateAdd({ draft, existing: duplicate.matchingRows[0] });
+      setToast({
+        tone: "warning",
+        text: duplicate.possibleDuplicate
+          ? "该达人在当前店铺的同一产品项目下可能已重复录入，建议检查是否需要合并。"
+          : "同店铺多样品：该达人在当前店铺有不同产品合作，可继续保存。",
+      });
+      setActiveModule("creators");
+      return;
+    }
+    if (creatorName && duplicate.multiSample) {
+      setToast({
+        tone: "warning",
+        text: "同店铺多样品：该达人在当前店铺有不同产品合作，可继续保存。",
+      });
+    } else if (creatorName && duplicate.crossStoreCreator) {
+      setToast({
+        tone: "warning",
+        text: "跨店铺达人：该达人在其他店铺也有合作记录，请确认本次沟通是否需要区分店铺。",
+      });
+    }
+    addCreatorDraft(draft);
+  }
+
+  function toggleSelected(rowId: string) {
+    setSelectedIds((ids) =>
+      ids.includes(rowId) ? ids.filter((id) => id !== rowId) : [...ids, rowId],
+    );
+  }
+
+  function toggleSelectAll(event: ChangeEvent<HTMLInputElement>) {
+    setSelectedIds(
+      event.target.checked ? filteredRows.map((entry) => entry.row.id) : [],
+    );
+  }
+
+  function applyStatusToRows(ids: string[], status: CreatorStatus) {
+    setRows((currentRows) =>
+      currentRows.map((row) =>
+        ids.includes(row.id) ? { ...row, currentStatus: status } : row,
+      ),
+    );
+    setToast({
+      tone: "success",
+      text: `已更新 ${ids.length} 位达人状态为 ${displayStatus(status)}。`,
+    });
+  }
+
+  function selectedRowsSpanMultipleStores() {
+    const storeIds = new Set(
+      rows.filter((row) => selectedIds.includes(row.id)).map(rowStoreId),
+    );
+    return storeIds.size > 1;
+  }
+
+  function handleBulkStatusUpdate() {
+    if (selectedIds.length === 0) return;
+    if (
+      selectedRowsSpanMultipleStores() &&
+      !window.confirm(
+        "本次选择包含多个店铺的达人记录，请确认是否继续批量操作。",
+      )
+    )
+      return;
+    applyStatusToRows(selectedIds, bulkStatus);
+  }
+
+  async function copyText(text: string, successText = "复制成功。") {
+    try {
+      await navigator.clipboard.writeText(text);
+      setToast({ tone: "success", text: successText });
+    } catch {
+      setToast({ tone: "warning", text: "复制失败，请手动复制。" });
+    }
+  }
+
+  function buildOutreachForRow(row: CreatorRow) {
+    const campaignRequirements = campaignToFilmingRequirements(
+      campaignForRow(row),
+      filmingRequirements,
+    );
+    const product = outgoingEnglishValue(
+      row.product || campaignRequirements.productName,
+      "[Product Name]",
+    );
+    const creator = outgoingEnglishValue(
+      displayName(row),
+      "[Creator Name]",
+    ).replace(/^@/, "");
+    const greetingName = creator.startsWith("[") ? creator : `@${creator}`;
+    return `Hi ${greetingName}, this is for ${row.storeName || DEFAULT_STORE_NAME}. We love your TikTok pet content and would like to invite you to collaborate on ${product}. Are you open to receiving a sample and creating ${parseRequiredVideos(campaignRequirements)} TikTok Shop video(s)?`;
+  }
+
+  function handleBulkCopyOutreach() {
+    const selectedRows = rows.filter((row) => selectedIds.includes(row.id));
+    if (selectedRows.length === 0) return;
+    if (
+      selectedRowsSpanMultipleStores() &&
+      !window.confirm(
+        "本次选择包含多个店铺的达人记录，请确认是否继续批量操作。",
+      )
+    )
+      return;
+    void copyText(
+      selectedRows.map(buildOutreachForRow).join("\n\n---\n\n"),
+      `已复制 ${selectedRows.length} 条邀约话术。`,
+    );
+  }
+
+  function buildLocalMessageForTask(task: Task): GeneratedMessage {
+    const creatorCampaign = campaignForRow(task);
+    return generateMessage(
+      task,
+      channel,
+      campaignToFilmingRequirements(creatorCampaign, activeFilmingRequirements),
+      replyFocus,
+      {
+        relationshipNote: replyRelationshipNote,
+        replyTone,
+        replyGoal,
+        acceptableConcession: replyConcession,
+      },
+    );
+  }
+
+  useEffect(() => {
+    if (!selectedTask) {
+      setMessage(null);
+      setMessageSource("local");
+      return;
+    }
+    if (messageSource === "deepseek") return;
+    setMessage(buildLocalMessageForTask(selectedTask));
+    setMessageSource("local");
+  }, [
+    selectedTask?.id,
+    selectedTask?.currentStatus,
+    selectedTask?.sampleShippingStatus,
+    selectedTask?.sampleDeliveredDate,
+    selectedTask?.videoProgress,
+    selectedTask?.lastFollowUpCount,
+    selectedTask?.trackingStatus,
+    selectedTask?.lastCreatorResponse,
+    selectedTask?.notes,
+    channel,
+    replyFocus,
+    replyRelationshipNote,
+    replyTone,
+    replyGoal,
+    replyConcession,
+    activeFilmingRequirements,
+    mergedCampaigns,
+    messageSource,
+  ]);
+
+  function handleGenerateMessage() {
+    if (!selectedTask) return;
+    const generated = buildLocalMessageForTask(selectedTask);
+    setMessage(generated);
+    setMessageSource("local");
+    setSelectedCreatorId(selectedTask.id);
+    setIsQueueExpanded(false);
+    scrollToMessageArea();
+  }
+
+  function updateGeneratedEnglishMessage(english: string) {
+    if (!message) return;
+    setMessage({ ...message, english });
+  }
+
+  function baseCreatorReply(task: Task): string {
+    const latestCreatorReply = task.followUpHistory
+      ?.slice()
+      .reverse()
+      .find((entry) => entry.action === "Creator Replied" && entry.note?.trim())
+      ?.note?.trim();
+    return (
+      task.lastCreatorResponse?.trim() ||
+      latestCreatorReply ||
+      task.notes.trim()
+    );
+  }
+
+  function currentCreatorReply(task: Task): string {
+    return editedCreatorReplies[task.id] ?? baseCreatorReply(task);
+  }
+
+  function updateCurrentCreatorReply(task: Task, value: string) {
+    setEditedCreatorReplies((current) => ({ ...current, [task.id]: value }));
+    setDeepSeekChineseTranslation("");
+    setDeepSeekChineseExplanation("");
+    setDeepSeekDetectedIntent("");
+    setDeepSeekRecommendedTrackingStatus("");
+  }
+
+  function campaignForRow(
+    row: Pick<CreatorRow, "storeId" | "storeName" | "product" | "campaignId">,
+  ): Campaign | undefined {
+    const storeId = normalizeStoreId(row.storeId, row.storeName);
+    return mergedCampaigns.find(
+      (campaign) =>
+        campaign.storeId === storeId &&
+        ((row.campaignId && campaign.id === row.campaignId) ||
+          campaign.productName === row.product),
+    );
+  }
+
+  function campaignForProduct(product: string): Campaign | undefined {
+    return mergedCampaigns.find(
+      (campaign) =>
+        (selectedStore === ALL_STORES ||
+          normalizeStoreId(campaign.storeId, campaign.storeName) ===
+            selectedStore) &&
+        campaign.productName === product,
+    );
+  }
+
+  function requiredVideosForProduct(product: string): number {
+    return parseRequiredVideos(
+      campaignToFilmingRequirements(
+        campaignForProduct(product),
+        activeFilmingRequirements,
+      ),
+    );
+  }
+
+  function requiredVideosForRow(row: CreatorRow): number {
+    return parseRequiredVideos(
+      campaignToFilmingRequirements(
+        campaignForRow(row),
+        activeFilmingRequirements,
+      ),
+    );
+  }
+
+  function selectedTaskCampaignRequirements(
+    task: Task,
+  ): CreatorFilmingRequirements {
+    return campaignToFilmingRequirements(
+      campaignForRow(task),
+      activeFilmingRequirements,
+    );
+  }
+
+  function campaignRequirementEntries(
+    requirements: CreatorFilmingRequirements,
+  ): Array<{ label: string; value: string }> {
+    return [
+      { label: "产品名称", value: requirements.productName },
+      { label: "必须展示内容", value: requirements.requiredScenes },
+      { label: "产品卖点", value: requirements.sellingPoints },
+      { label: "视频时长要求", value: requirements.videoLength },
+      { label: "视频数量要求", value: requirements.videoCount },
+      { label: "不希望达人这样拍", value: requirements.avoidShots },
+      {
+        label: "挂车 / TikTok Shop 产品链接要求",
+        value: requirements.productLinkRequirement,
+      },
+      { label: "参考视频链接", value: requirements.referenceVideoLinks },
+    ];
+  }
+
+  function buildCampaignContext(task: Task): string {
+    const campaign = campaignForRow(task);
+    const requirements = campaignToFilmingRequirements(
+      campaign,
+      activeFilmingRequirements,
+    );
+    return [
+      `店铺 / 品牌：${task.storeName}`,
+      `产品名称：${task.product || requirements.productName}`,
+      `必须展示内容：${requirements.requiredScenes}`,
+      `产品卖点：${requirements.sellingPoints}`,
+      `视频时长要求：${requirements.videoLength}`,
+      `视频数量要求：${requirements.videoCount}`,
+      `不希望达人这样拍：${requirements.avoidShots}`,
+      `挂车 / TikTok Shop 产品链接要求：${requirements.productLinkRequirement}`,
+      `参考视频链接：${requirements.referenceVideoLinks}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  function buildDeepSeekPayload(task: Task, action: DeepSeekAction) {
+    const campaign = campaignForRow(task);
+    const requirements = campaignToFilmingRequirements(
+      campaign,
+      activeFilmingRequirements,
+    );
+    return {
+      action,
+      creatorUsername: displayName(task),
+      storeName: task.storeName,
+      creatorReply: currentCreatorReply(task),
+      userReplyFocus: replyFocus,
+      creatorRelationshipNote: replyRelationshipNote,
+      replyTone,
+      replyGoal,
+      acceptableConcession: replyConcession,
+      channel,
+      productName: task.product || requirements.productName,
+      requiredScenes: requirements.requiredScenes,
+      productSellingPoints: requirements.sellingPoints,
+      filmingRequirements: requirements.requiredScenes,
+      requiredVideoCount: requirements.videoCount,
+      requiredVideoLength: requirements.videoLength,
+      doNotFilmLikeThis: requirements.avoidShots,
+      productLinkRequirement: requirements.productLinkRequirement,
+      referenceVideoLinks: requirements.referenceVideoLinks,
+      currentStatus:
+        task.currentStatus || displayStatus(inferStatus(task, requiredVideos)),
+      campaignContext: buildCampaignContext(task),
+      chineseUnderstanding: deepSeekChineseTranslation,
+    };
+  }
+
+  function deepSeekErrorMessage(error: unknown): string {
+    if (error instanceof Error && error.message) return error.message;
+    return "DeepSeek 调用失败，请检查 API Key 或稍后重试。";
+  }
+
+  async function callDeepSeek(action: DeepSeekAction) {
+    if (!selectedTask) return;
+    setDeepSeekLoadingAction(action);
+    setDeepSeekError("");
+    try {
+      if (action === "generate_personalized_reply" && !message) {
+        setMessage(buildLocalMessageForTask(selectedTask));
+        setMessageSource("local");
+      }
+
+      const response = await fetch("/api/deepseek-reply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildDeepSeekPayload(selectedTask, action)),
+      });
+      const result = (await response.json()) as Partial<
+        DeepSeekTranslateResult & DeepSeekGenerateResult & { error: string }
+      >;
+      if (!response.ok)
+        throw new Error(
+          result.error || "DeepSeek 调用失败，请检查 API Key 或稍后重试。",
+        );
+
+      if (action === "translate_creator_reply") {
+        setDeepSeekChineseTranslation(result.chineseTranslation || "");
+        setDeepSeekDetectedIntent("");
+        return;
+      }
+
+      const localFallback = message ?? buildLocalMessageForTask(selectedTask);
+      setMessage({
+        ...localFallback,
+        english: result.englishMessage || localFallback.english,
+        chineseExplanation:
+          result.chineseExplanation || localFallback.chineseExplanation,
+      });
+      setMessageSource(result.englishMessage ? "deepseek" : "local");
+      setDeepSeekDetectedIntent(result.detectedIntent || "");
+      setDeepSeekChineseExplanation(result.chineseExplanation || "");
+      setDeepSeekRecommendedTrackingStatus(
+        result.recommendedTrackingStatus || "",
+      );
+    } catch (error) {
+      setDeepSeekError(deepSeekErrorMessage(error));
+    } finally {
+      setDeepSeekLoadingAction(null);
+    }
+  }
+
+  async function handleCopyGeneratedMessage() {
+    if (!message) return;
+    await copyText(message.english, "已复制英文话术。");
+    setTrackingStatus("已复制英文话术。");
+  }
+
+  function markCreatorMessageSent(
+    rowId: string,
+    scenario: string,
+    english: string,
+    selectedChannel: Channel,
+  ) {
+    const today = todayString();
+    setRows((currentRows) =>
+      currentRows.map((row) =>
+        row.id === rowId
+          ? {
+              ...row,
+              currentStatus:
+                inferStatus(row, requiredVideos) === "Not Contacted"
+                  ? "Invited"
+                  : row.currentStatus,
+              lastContactDate: today,
+              lastFollowUpCount: row.lastFollowUpCount + 1,
+              trackingStatus: "已发送待回复",
+              lastMessageScenario: scenario,
+              lastMessageChannel: selectedChannel,
+              lastMessageSentAt: today,
+              lastHandledDate: today,
+              nextFollowUpDate: addDays(2),
+              lastCreatorResponse:
+                editedCreatorReplies[rowId] ?? row.lastCreatorResponse,
+              followUpHistory: [
+                ...(row.followUpHistory ?? []),
+                {
+                  date: today,
+                  action: "Message Sent",
+                  channel: selectedChannel,
+                  scenario,
+                  message: english,
+                },
+              ],
+            }
+          : row,
+      ),
+    );
+  }
+
+  function handleMarkMessageSent() {
+    if (!selectedTask || !message) return;
+    markCreatorMessageSent(
+      selectedTask.id,
+      message.scenario,
+      message.english,
+      channel,
+    );
+    finishProcessing("已记录处理结果。");
+  }
+
+  function markCreatorNoReply() {
+    if (!selectedTask) return;
+    const today = todayString();
+    setRows((currentRows) =>
+      currentRows.map((row) =>
+        row.id === selectedTask.id
+          ? {
+              ...row,
+              lastContactDate: today,
+              lastHandledDate: today,
+              trackingStatus: "未回复待跟进",
+              nextFollowUpDate: addDays(1),
+              followUpHistory: [
+                ...(row.followUpHistory ?? []),
+                {
+                  date: today,
+                  action: "No Reply",
+                  note: row.notes.trim() || "今日检查，达人未回复。",
+                },
+              ],
+            }
+          : row,
+      ),
+    );
+    finishProcessing("已记录处理结果。");
+  }
+
+  function markCreatorSkippedToday() {
+    if (!selectedTask) return;
+    const today = todayString();
+    const note = selectedTask.notes.trim() || "今日暂不跟进。";
+    setRows((currentRows) =>
+      currentRows.map((row) =>
+        row.id === selectedTask.id
+          ? {
+              ...row,
+              lastHandledDate: today,
+              trackingStatus: "今日已跳过",
+              nextFollowUpDate: addDays(1),
+              followUpHistory: [
+                ...(row.followUpHistory ?? []),
+                { date: today, action: "Skipped Today", note },
+              ],
+            }
+          : row,
+      ),
+    );
+    finishProcessing("已记录今日暂不跟进。");
+  }
+
+  function finishProcessing(messageText: string) {
+    setTrackingStatus(messageText);
+    setLastProcessingResult(messageText);
+    setShowNextCreatorPrompt(true);
+    setToast({ tone: "success", text: messageText });
+  }
+
+  function markVideoProgress() {
+    if (!selectedTask) return;
+    const today = todayString();
+    const selectedRequiredVideos = parseRequiredVideos(
+      selectedTaskCampaignRequirements(selectedTask),
+    );
+    const current = normalizeVideoProgress(
+      selectedTask.videoProgress,
+      selectedRequiredVideos,
+    );
+    const nextPosted = (current.postedCount ?? 0) + 1;
+    const reachedRequirement = nextPosted >= selectedRequiredVideos;
+    setRows((currentRows) =>
+      currentRows.map((row) => {
+        if (row.id !== selectedTask.id) return row;
+        return {
+          ...row,
+          currentStatus: reachedRequirement
+            ? "视频已达要求，待确认合作完成"
+            : `已发布 ${nextPosted} 条 / 待补剩余视频`,
+          trackingStatus: reachedRequirement
+            ? "视频数量已达要求"
+            : "已发布部分视频",
+          videoProgress: `${nextPosted}/${selectedRequiredVideos}`,
+          videoProgressWarning: undefined,
+          firstVideoPostedDate: row.firstVideoPostedDate || today,
+          latestVideoPostedDate: today,
+          lastHandledDate: today,
+          nextFollowUpDate: reachedRequirement ? today : addDays(2),
+          followUpHistory: [
+            ...(row.followUpHistory ?? []),
+            {
+              date: today,
+              action: "Video Posted",
+              note: `已记录达人发布 1 条视频，当前进度 ${nextPosted}/${selectedRequiredVideos}。`,
+            },
+          ],
+        };
+      }),
+    );
+    finishProcessing(
+      reachedRequirement
+        ? "已达到产品视频数量要求，请确认是否合作完成。"
+        : "已记录达人发布 1 条视频。",
+    );
+  }
+
+  function handleManualVideoProgressUpdate() {
+    if (!selectedTask) return;
+    const progress = window.prompt(
+      "视频进度：可填 0/1、1/1、0/2、1/2 或自定义",
+      selectedTask.videoProgress ||
+        `0/${parseRequiredVideos(selectedTaskCampaignRequirements(selectedTask))}`,
+    );
+    if (progress === null) return;
+    const firstDate = window.prompt(
+      "首条视频发布日期（YYYY-MM-DD，可留空）",
+      selectedTask.firstVideoPostedDate || "",
+    );
+    if (firstDate === null) return;
+    const latestDate = window.prompt(
+      "最近视频发布日期（YYYY-MM-DD，可留空）",
+      selectedTask.latestVideoPostedDate || firstDate || "",
+    );
+    if (latestDate === null) return;
+    const note =
+      window.prompt("视频进度备注（可留空）", "手动更新视频进度。") ?? "";
+    const today = todayString();
+    setRows((currentRows) =>
+      currentRows.map((row) => {
+        if (row.id !== selectedTask.id) return row;
+        const updated = updateCreatorField(
+          row,
+          "videoProgress",
+          progress,
+          requiredVideos,
+        );
+        return {
+          ...updated,
+          firstVideoPostedDate: firstDate,
+          latestVideoPostedDate: latestDate,
+          lastHandledDate: today,
+          nextFollowUpDate:
+            normalizeVideoProgress(progress, requiredVideos).postedCount === 2
+              ? ""
+              : row.nextFollowUpDate,
+          followUpHistory: [
+            ...(row.followUpHistory ?? []),
+            {
+              date: today,
+              action: "Video Posted",
+              note: note || `手动更新视频进度为 ${progress}。`,
+            },
+          ],
+        };
+      }),
+    );
+    finishProcessing("已手动更新视频进度。");
+  }
+
+  function markCreatorOutcome(outcome: "Completed" | "Failed") {
+    if (!selectedTask) return;
+    const today = todayString();
+    setRows((currentRows) =>
+      currentRows.map((row) =>
+        row.id === selectedTask.id
+          ? {
+              ...row,
+              currentStatus: outcome === "Completed" ? "Completed" : "Lost",
+              trackingStatus: outcome === "Completed" ? "合作完成" : "合作失败",
+              lastHandledDate: today,
+              nextFollowUpDate: "",
+              archivedAt: today,
+              archiveReason: outcome,
+              followUpHistory: [
+                ...(row.followUpHistory ?? []),
+                {
+                  date: today,
+                  action: outcome,
+                  note:
+                    outcome === "Completed"
+                      ? "今日合作完成。"
+                      : "今日合作失败。",
+                },
+              ],
+            }
+          : row,
+      ),
+    );
+    setTrackingStatus("已记录处理结果。");
+    setLastProcessingResult("已记录处理结果。");
+    setShowNextCreatorPrompt(true);
+    setToast({
+      tone: "success",
+      text: outcome === "Completed" ? "已合作完成。" : "已合作失败。",
+    });
+  }
+
+  function handleMarkCreatorReplied() {
+    if (!selectedTask) return;
+    const note = window.prompt("记录达人回复内容或下一步重点：") ?? "";
+    const today = todayString();
+    setRows((currentRows) =>
+      currentRows.map((row) =>
+        row.id === selectedTask.id
+          ? {
+              ...row,
+              currentStatus: "Replied",
+              trackingStatus: "达人回复待处理",
+              lastContactDate: today,
+              lastCreatorResponse: note,
+              lastHandledDate: today,
+              nextFollowUpDate: addDays(1),
+              followUpHistory: [
+                ...(row.followUpHistory ?? []),
+                { date: today, action: "Creator Replied", note },
+              ],
+            }
+          : row,
+      ),
+    );
+    finishProcessing("已记录达人回复。");
+  }
+
+  function handleSaveFilmingRequirements() {
+    const keyContentPoints = normalizeListText(keyContentPointsDraft);
+    const requirements = normalizeListText(filmingRequirementsDraft);
+    const referenceLinks = normalizeListText(referenceLinksDraft);
+    const next: CreatorFilmingRequirements = {
+      ...defaultCreatorFilmingRequirements,
+      productName:
+        filmingProductNameDraft.trim() ||
+        defaultCreatorFilmingRequirements.productName,
+      requiredScenes:
+        keyContentPoints.join("；") ||
+        defaultCreatorFilmingRequirements.requiredScenes,
+      videoCount:
+        requirements.find((item) => item.includes("条视频")) ||
+        defaultCreatorFilmingRequirements.videoCount,
+      videoLength:
+        requirements.find((item) => item.includes("秒")) ||
+        defaultCreatorFilmingRequirements.videoLength,
+      productLinkRequirement:
+        requirements.find((item) => item.includes("链接")) ||
+        defaultCreatorFilmingRequirements.productLinkRequirement,
+      requirements,
+      keyContentPoints,
+      referenceLinks,
+      referenceVideoLinks: referenceLinks.join("\n"),
+    };
+    setFilmingRequirements(next);
+    setTemplateForm((form) => ({
+      ...form,
+      productName: next.productName,
+      videos: String(parseRequiredVideos(next)),
+    }));
+    saveFilmingRequirements(next);
+    setIsEditingFilmingRequirements(false);
+    setToast({ tone: "success", text: "拍摄要求已保存。" });
+  }
+
+  function handleEditFilmingRequirements() {
+    setFilmingProductNameDraft(filmingRequirements.productName);
+    setFilmingRequirementsDraft(listToText(filmingRequirements.requirements));
+    setKeyContentPointsDraft(listToText(filmingRequirements.keyContentPoints));
+    setReferenceLinksDraft(listToText(filmingRequirements.referenceLinks));
+    setIsEditingFilmingRequirements(true);
+  }
+
+  function handleRestoreDefaultFilmingRequirements() {
+    setFilmingProductNameDraft(defaultCreatorFilmingRequirements.productName);
+    setFilmingRequirementsDraft(
+      listToText(defaultCreatorFilmingRequirements.requirements),
+    );
+    setKeyContentPointsDraft(
+      listToText(defaultCreatorFilmingRequirements.keyContentPoints),
+    );
+    setReferenceLinksDraft(
+      listToText(defaultCreatorFilmingRequirements.referenceLinks),
+    );
+    setFilmingRequirements(defaultCreatorFilmingRequirements);
+    saveFilmingRequirements(defaultCreatorFilmingRequirements);
+    setIsEditingFilmingRequirements(false);
+    setToast({ tone: "success", text: "已恢复默认拍摄要求。" });
+  }
+
+  function handleOpenPromptHelper() {
+    const helperRequirements = campaignToFilmingRequirements(
+      activeCampaign ?? mergedCampaigns[0],
+      filmingRequirements,
+    );
+    setPromptHelperForm({
+      sellingPoints: "",
+      videoCount: String(parseRequiredVideos(helperRequirements)),
+      durationRequirement: "",
+      targetPetOrScene: "",
+      mustShowShots: "",
+      avoidShots: "",
+      referenceLinks:
+        helperRequirements.referenceVideoLinks ||
+        listToText(helperRequirements.referenceLinks),
+    });
+    setGeneratedChatGptPrompt("");
+    setPromptCopyStatus("");
+    setIsPromptHelperOpen(true);
+  }
+
+  function buildChatGptPrompt() {
+    return `请你作为熟悉美国 TikTok Shop 达人合作沟通的内容运营，基于下面的产品信息，生成一版可以直接发给达人的中文「达人拍摄要求」。\n\n【产品信息】\n- 产品名称：${activeFilmingRequirements.productName}\n- 产品卖点：${promptHelperForm.sellingPoints || "请补充"}\n- 目标视频数量：${promptHelperForm.videoCount || requiredVideos}\n- 单条视频时长要求：${promptHelperForm.durationRequirement || "40s+"}\n- 目标宠物 / 使用场景：${promptHelperForm.targetPetOrScene || "真实宠物使用场景"}\n- 必须展示的画面：${promptHelperForm.mustShowShots || "开箱、使用过程、CTA"}\n- 不希望达人这样拍：${promptHelperForm.avoidShots || "避免违规表述"}\n- 对标视频链接（可选）：${promptHelperForm.referenceLinks || "无"}\n\n请按以下结构输出，全部使用简体中文：\n1. 产品名称\n2. 达人拍摄要求\n3. 重点拍摄内容`;
+  }
+
+  function renderPageHeader(
+    title: string,
+    description: string,
+    action?: ReactNode,
+  ) {
+    return (
+      <div className="page-header">
+        <div>
+          <p className="eyebrow">TikTok Shop Creator SOP</p>
+          <h1>{title}</h1>
+          <p>{description}</p>
+        </div>
+        {action}
+      </div>
+    );
+  }
+
+  function renderCampaignSelector() {
+    return (
+      <section className="campaign-switcher" aria-label="当前店铺和产品项目">
+        <label>
+          当前店铺 / 品牌
+          <select
+            value={selectedStore}
+            onChange={(event) => {
+              setSelectedStore(event.target.value);
+              setSelectedCampaign("ALL");
+              setSelectedIds([]);
+              setSelectedCreatorId("");
+              setMessage(null);
+              setMessageSource("local");
+            }}
+          >
+            <option value={ALL_STORES}>全部店铺</option>
+            {stores.map((store) => (
+              <option key={store.id} value={store.id}>
+                {store.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          当前产品项目
+          <select
+            value={selectedCampaign}
+            onChange={(event) => {
+              setSelectedCampaign(event.target.value);
+              setSelectedIds([]);
+              setSelectedCreatorId("");
+              setMessage(null);
+              setMessageSource("local");
+              setIsQueueExpanded(true);
+              setOnlyCurrentCreator(false);
+            }}
+          >
+            <option value="ALL">全部产品</option>
+            {activeCampaigns.map((campaign) => (
+              <option
+                key={campaignOptionValue(campaign)}
+                value={campaignSelectValue(campaign, activeCampaigns)}
+              >
+                {campaignLabel(campaign, showStoreLabels)}
+                {campaign.archivedAt ? "（已归档）" : ""}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="campaign-context">
+          <strong>
+            {selectedCampaign === "ALL"
+              ? selectedStore === ALL_STORES
+                ? "全部店铺 · 全部产品组合视图"
+                : `${stores.find((store) => store.id === selectedStore)?.name ?? "未分配店铺"} · 全部产品`
+              : activeCampaign
+                ? campaignLabel(activeCampaign, showStoreLabels)
+                : "未分配店铺 · 产品项目不可用"}
+          </strong>
+          <span>
+            {selectedCampaign === "ALL"
+              ? "看板、表格、队列按当前店铺过滤；全部店铺视图会显示店铺标签，且不会合并同名产品。"
+              : "当前页面按该产品项目过滤，并使用该产品的拍摄要求与参考链接。"}
+          </span>
+        </div>
+      </section>
+    );
+  }
+
+  function campaignStats(campaign: Campaign) {
+    const campaignRows = rows.filter((row) =>
+      rowMatchesCampaign(row, campaign),
+    );
+    const campaignRequirements = campaignToFilmingRequirements(
+      campaign,
+      filmingRequirements,
+    );
+    const campaignRequiredVideos = parseRequiredVideos(campaignRequirements);
+    const activeCampaignRows = campaignRows.filter((row) =>
+      isActiveDailyCollaboration(row, campaignRequiredVideos),
+    );
+    const campaignTasks = analyzeCreators(
+      activeCampaignRows,
+      undefined,
+      campaignRequiredVideos,
+    );
+    const campaignTaskMap = new Map(
+      campaignTasks.map((task) => [task.id, task]),
+    );
+    return {
+      creatorCount: campaignRows.length,
+      activeCount: activeCampaignRows.length,
+      todayFollowUp: campaignTasks.filter(
+        (task) => task.needsFollowUp && !isHandledToday(task),
+      ).length,
+      highPriority: campaignTasks.filter((task) => task.priority === "High")
+        .length,
+      inTransit: activeCampaignRows.filter(
+        (row) => inferStatus(row, campaignRequiredVideos) === "Sample Shipped",
+      ).length,
+      deliveredPending: activeCampaignRows.filter((row) =>
+        ["Delivered", "Waiting Video"].includes(
+          inferStatus(row, campaignRequiredVideos),
+        ),
+      ).length,
+      postedVideos: campaignRows.reduce(
+        (sum, row) =>
+          sum +
+          (normalizeVideoProgress(row.videoProgress, campaignRequiredVideos)
+            .postedCount ?? 0),
+        0,
+      ),
+      completed: campaignRows.filter(
+        (row) =>
+          inferStatus(row, campaignRequiredVideos) === "Completed" ||
+          campaignTaskMap.get(row.id)?.trackingStatus === "Completed",
+      ).length,
+      failed: campaignRows.filter(
+        (row) =>
+          inferStatus(row, campaignRequiredVideos) === "Lost" ||
+          campaignTaskMap.get(row.id)?.trackingStatus === "Failed",
+      ).length,
+    };
+  }
+
+  function renderCampaignOverview() {
+    return (
+      <section className="campaign-overview">
+        <div className="section-heading">
+          <div>
+            <h2>产品项目概览</h2>
+            <p className="muted">
+              按产品 Campaign 分离达人、样品、视频履约和失败风险。
+            </p>
+          </div>
+        </div>
+        <div className="campaign-card-grid">
+          {storeFilteredCampaigns.map((campaign) => {
+            const stats = campaignStats(campaign);
+            return (
+              <button
+                type="button"
+                key={campaign.id}
+                className="campaign-card"
+                aria-label={`${campaignLabel(campaign, showStoreLabels)}${stats.creatorCount} 位达人`}
+                onClick={() =>
+                  setSelectedCampaign(campaignOptionValue(campaign))
+                }
+              >
+                <span className="product-badge">
+                  {campaignLabel(campaign, showStoreLabels)}
+                </span>
+                <strong>
+                  总合作记录 / 总达人数：{stats.creatorCount} 位达人
+                </strong>
+                <div className="campaign-metrics">
+                  <span>
+                    进行中 <b>{stats.activeCount}</b>
+                  </span>
+                  <span>
+                    今日需跟进 <b>{stats.todayFollowUp}</b>
+                  </span>
+                  <span>
+                    高优先级 <b>{stats.highPriority}</b>
+                  </span>
+                  <span>
+                    样品运输中 <b>{stats.inTransit}</b>
+                  </span>
+                  <span>
+                    到货待拍 <b>{stats.deliveredPending}</b>
+                  </span>
+                  <span>
+                    已发布视频 <b>{stats.postedVideos}</b>
+                  </span>
+                  <span>
+                    已完成 <b>{stats.completed}</b>
+                  </span>
+                  <span>
+                    已失败 <b>{stats.failed}</b>
+                  </span>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+    );
+  }
+
+  function renderImportCard() {
+    return (
+      <section className="panel compact-panel">
+        <div className="section-heading">
+          <div>
+            <h2>数据导入 / 导出</h2>
+            <p className="muted">
+              支持 Excel / CSV 导入导出，数据保存在当前浏览器。
+            </p>
+          </div>
+          <div className="inline-actions">
+            <label className="file-button">
+              导入 Excel / CSV
+              <input
+                type="file"
+                accept=".csv,.xls,.xlsx"
+                onChange={(event) => void handleFile(event.target.files?.[0])}
+              />
+            </label>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => downloadCreatorRowsCsv(rows)}
+              disabled={rows.length === 0}
+            >
+              导出 CSV
+            </button>
+            <button type="button" onClick={handleAddCreator}>
+              新增达人
+            </button>
+          </div>
+        </div>
+        {fileName && <p className="muted">已加载：{fileName}</p>}
+        {importSummary && <p className="warning-text">{importSummary}</p>}
+        {pendingDuplicateAdd && (
+          <div className="inline-warning duplicate-warning">
+            <strong>该达人已存在。你可以选择：</strong>
+            <span>
+              检测到该达人已存在。请确认这是重复录入，还是同一达人申请了不同样品。
+            </span>
+            <button
+              type="button"
+              onClick={() =>
+                addCreatorDraft(
+                  pendingDuplicateAdd.draft,
+                  pendingDuplicateAdd.existing,
+                )
+              }
+            >
+              继续新增为不同样品
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() =>
+                addCreatorDraft(
+                  pendingDuplicateAdd.draft,
+                  pendingDuplicateAdd.existing,
+                )
+              }
+            >
+              复制已有达人基础信息
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => setPendingDuplicateAdd(null)}
+            >
+              取消新增
+            </button>
+          </div>
+        )}
+        {error && <p className="error">{error}</p>}
+      </section>
+    );
+  }
+
+  function handleLocateCreator() {
+    const normalized = followupSearch.trim().toLowerCase();
+    if (!normalized) {
+      setCreatorSearchStatus("请输入达人账号或关键词。");
+      return;
+    }
+    const matches = tasks.filter((task) =>
+      [task.username, task.profileLink, task.product, task.notes]
+        .join(" ")
+        .toLowerCase()
+        .includes(normalized),
+    );
+    if (matches.length === 0) {
+      setCreatorSearchStatus("未找到该达人。");
+      return;
+    }
+    if (matches.length === 1) {
+      handleSelectCreator(matches[0].id);
+      setMessage(buildLocalMessageForTask(matches[0]));
+      setCreatorSearchStatus(`已定位 ${displayName(matches[0])}。`);
+      return;
+    }
+    setIsQueueExpanded(true);
+    setCreatorSearchStatus(`找到 ${matches.length} 条结果，请在下方列表选择。`);
+  }
+
+  function renderDashboard() {
+    const shouldShowReplyBlock = Boolean(
+      selectedTask &&
+      (message ||
+        (selectedTask.trackingStatus ?? "").match(
+          /Replied|Reply Pending|达人已回复|达人回复待处理/i,
+        ) ||
+        selectedTask.lastCreatorResponse?.trim() ||
+        selectedTask.notes.trim()),
+    );
+    const priorityText = priorityLabel;
+    const selectedStatus = selectedTask
+      ? inferStatus(selectedTask, requiredVideos)
+      : "Not Contacted";
+
+    return (
+      <>
+        {renderPageHeader(
+          "今日工作台",
+          "每天打开后，先选产品项目，再按优先级处理今天要联系的达人。",
+          <button type="button" onClick={() => setActiveModule("creators")}>
+            打开达人数据库
+          </button>,
+        )}
+        {renderCampaignOverview()}
+        <section className="dashboard-grid" aria-label="今日概览">
+          {dashboardCards.map((card) => (
+            <button
+              type="button"
+              key={card.label}
+              className="metric-card"
+              onClick={() => handleDashboardCardClick(card)}
+            >
+              <span>{card.label}</span>
+              <strong>{card.value}</strong>
+              <small>
+                {selectedCampaign === "ALL" ? "全部产品" : selectedCampaign}
+              </small>
+            </button>
+          ))}
+        </section>
+        <section
+          className="panel generator-panel workbench-panel"
+          ref={queueRef}
+        >
+          <div className="section-heading">
+            <div>
+              <h2>今日待处理达人队列</h2>
+              <p className="muted">
+                当前队列已按「
+                {selectedCampaign === "ALL" ? "全部产品" : selectedCampaign}
+                」过滤{workbenchFilter ? ` · ${workbenchFilter.label}` : ""}
+                。选择达人后会自动收起长队列，直接进入处理区。
+              </p>
+            </div>
+            <div className="inline-actions">
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => setOnlyCurrentCreator((value) => !value)}
+              >
+                {onlyCurrentCreator ? "显示达人队列" : "只看当前达人"}
+              </button>
+              {workbenchFilter && (
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => {
+                    setWorkbenchFilter(null);
+                    setSelectedCreatorId("");
+                  }}
+                >
+                  清除卡片筛选
+                </button>
+              )}
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => setIsQueueExpanded((value) => !value)}
+              >
+                {isQueueExpanded ? "收起达人队列" : "展开达人队列"}
+              </button>
+            </div>
+          </div>
+          <div className="generator-controls workbench-controls">
+            <label>
+              搜索队列
+              <input
+                value={followupSearch}
+                onChange={(event) => setFollowupSearch(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") handleLocateCreator();
+                }}
+                placeholder="达人 / 产品 / 状态 / 跟进状态 / 紧急程度"
+              />
+            </label>
+            <button
+              type="button"
+              className="secondary"
+              onClick={handleLocateCreator}
+            >
+              定位达人
+            </button>
+            {creatorSearchStatus && (
+              <p className="ai-status">{creatorSearchStatus}</p>
+            )}
+            <label className="checkbox-field">
+              <input
+                aria-label="显示已归档合作"
+                type="checkbox"
+                checked={showArchivedCollaborations}
+                onChange={(event) =>
+                  setShowArchivedCollaborations(event.target.checked)
+                }
+              />
+              显示归档达人
+            </label>
+            <label>
+              紧急程度
+              <select
+                value={followupUrgency}
+                onChange={(event) =>
+                  setFollowupUrgency(
+                    event.target.value as typeof followupUrgency,
+                  )
+                }
+              >
+                <option value="All">全部</option>
+                <option value="High">高</option>
+                <option value="Medium">中</option>
+                <option value="Low">低</option>
+              </select>
+            </label>
+            <label className="checkbox-field">
+              <input
+                type="checkbox"
+                checked={showProcessedToday}
+                onChange={(event) =>
+                  setShowProcessedToday(event.target.checked)
+                }
+              />
+              显示今日已处理
+            </label>
+            <label>
+              选择达人
+              <select
+                aria-label="选择达人"
+                value={selectedTask?.id ?? ""}
+                onChange={(event) => handleSelectCreator(event.target.value)}
+              >
+                {filteredTasks.map((task) => (
+                  <option key={task.id} value={task.id}>
+                    {compactCreatorLabel(task)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              联系渠道
+              <select
+                value={channel}
+                onChange={(event) => setChannel(event.target.value as Channel)}
+              >
+                {CHANNELS.map((item) => (
+                  <option key={item}>{item}</option>
+                ))}
+              </select>
+            </label>
+            <button
+              type="button"
+              onClick={handleGenerateMessage}
+              disabled={!selectedTask}
+            >
+              生成话术
+            </button>
+          </div>
+          {!onlyCurrentCreator && isQueueExpanded && (
+            <div
+              className="queue-list compact-queue"
+              data-testid="creator-queue"
+            >
+              {filteredTasks.length > 0 ? (
+                filteredTasks.map((task) => (
+                  <button
+                    type="button"
+                    key={task.id}
+                    className={`queue-item ${selectedTask?.id === task.id ? "active" : ""}`}
+                    onClick={() => handleSelectCreator(task.id)}
+                  >
+                    <span className="queue-main-line">
+                      <strong>{creatorHandle(task)}</strong>
+                      <span className="queue-badges">
+                        <em>{priorityLabel(task)}</em>
+                        <em>{queueStatusLabel(task)}</em>
+                        {(activeSampleCounts.get(task.id) ?? 0) > 1 && (
+                          <em>同达人多样品</em>
+                        )}
+                      </span>
+                    </span>
+                    <span className="queue-sub-line">
+                      {selectedStore === ALL_STORES
+                        ? `${task.storeName || DEFAULT_STORE_NAME} · `
+                        : ""}
+                      {task.product || "缺少产品名称"} ·{" "}
+                      {task.currentStatus ||
+                        displayStatus(inferStatus(task, requiredVideos))}
+                    </span>
+                  </button>
+                ))
+              ) : (
+                <div className="empty-state compact-empty">
+                  <strong>当前筛选下暂无待处理达人。</strong>
+                </div>
+              )}
+            </div>
+          )}
+          {!onlyCurrentCreator && !isQueueExpanded && (
+            <div className="collapsed-copy queue-collapsed">
+              <strong>达人队列已收起。</strong>
+              <span>
+                当前只显示处理区，点击「展开达人队列」可继续查看全部待处理达人。
+              </span>
+            </div>
+          )}
+          {selectedTask ? (
+            <div
+              ref={currentCreatorRef}
+              className="current-creator-panel"
+              data-testid="current-creator-panel"
+            >
+              <div className="section-heading">
+                <div>
+                  <h2>当前处理达人</h2>
+                  <p className="muted">
+                    先确认状态，再生成 / 复制英文话术，发送后回到工具标记。
+                  </p>
+                </div>
+                {nextTask && (
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={handleProcessNextCreator}
+                  >
+                    处理下一个达人
+                  </button>
+                )}
+              </div>
+              <div className="current-creator-grid">
+                <span>
+                  达人账号<b>{displayName(selectedTask)}</b>
+                </span>
+                <span>
+                  店铺 / 品牌
+                  <b>{selectedTask.storeName || DEFAULT_STORE_NAME}</b>
+                </span>
+                <span>
+                  产品项目<b>{selectedTask.product || "缺少产品名称"}</b>
+                </span>
+                <span>
+                  当前状态
+                  <b>
+                    {selectedTask.currentStatus ||
+                      displayStatus(selectedStatus)}
+                  </b>
+                </span>
+                <span>
+                  紧急程度<b>{priorityText(selectedTask)}</b>
+                </span>
+                <span>
+                  优先级原因<b>{selectedTask.triggerReason}</b>
+                </span>
+                <span>
+                  沟通动作<b>{selectedTask.suggestedAction}</b>
+                </span>
+                <span>
+                  跟进状态<b>{selectedTask.trackingStatus || "—"}</b>
+                </span>
+                <span className="creator-note-preview">
+                  处理备注 / 达人备注<b>{selectedTask.notes.trim() || "—"}</b>
+                </span>
+              </div>
+              {getDuplicateCheck(selectedTask, rows).crossStoreCreator && (
+                <div className="inline-warning duplicate-warning">
+                  <strong>跨店铺达人</strong>
+                  <span>
+                    该达人在其他店铺也有合作记录，请确认本次沟通是否需要区分店铺。
+                  </span>
+                </div>
+              )}
+              {(activeSampleCounts.get(selectedTask.id) ?? 0) > 1 && (
+                <div className="inline-warning duplicate-warning">
+                  <strong>同达人多样品</strong>
+                  <span>
+                    该达人还有{" "}
+                    {(activeSampleCounts.get(selectedTask.id) ?? 1) - 1}{" "}
+                    个其他样品合作。该达人存在多个样品合作，请确认是否需要合并沟通。
+                  </span>
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => {
+                      setFollowupSearch(displayName(selectedTask));
+                      setOnlyCurrentCreator(false);
+                      setIsQueueExpanded(true);
+                    }}
+                  >
+                    查看其他样品记录
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() =>
+                      setToast({
+                        tone: "success",
+                        text: "生成多样品合并提醒：请在一条消息中列出多个产品，并分别确认每个样品的到货、拍摄和发布时间。",
+                      })
+                    }
+                  >
+                    生成多样品合并提醒
+                  </button>
+                </div>
+              )}
+              <details
+                className="more-info-card current-product-brief"
+                data-testid="current-product-filming-requirements"
+              >
+                <summary>当前产品拍摄要求</summary>
+                <div className="current-creator-grid secondary-grid">
+                  {campaignRequirementEntries(
+                    selectedTaskCampaignRequirements(selectedTask),
+                  ).map((item) => (
+                    <span key={item.label}>
+                      {item.label}
+                      <b>{item.value || "—"}</b>
+                    </span>
+                  ))}
+                </div>
+              </details>
+              <details className="more-info-card">
+                <summary>更多信息</summary>
+                <div className="current-creator-grid secondary-grid">
+                  <span>
+                    联系渠道<b>{channel}</b>
+                  </span>
+                  <span>
+                    最近联系日期<b>{selectedTask.lastContactDate || "—"}</b>
+                  </span>
+                  <span>
+                    样品状态<b>{selectedTask.sampleShippingStatus || "—"}</b>
+                  </span>
+                  <span>
+                    样品到货日期<b>{selectedTask.sampleDeliveredDate || "—"}</b>
+                  </span>
+                  <span>
+                    视频进度<b>{selectedTask.videoProgress || "—"}</b>
+                  </span>
+                  <span>
+                    首条视频发布时间
+                    <b>{selectedTask.firstVideoPostedDate || "—"}</b>
+                  </span>
+                  <span>
+                    最近回复日期
+                    <b>
+                      {selectedTask.followUpHistory
+                        ?.slice()
+                        .reverse()
+                        .find((entry) => entry.action === "Creator Replied")
+                        ?.date || "—"}
+                    </b>
+                  </span>
+                  <span>
+                    主页链接<b>{selectedTask.profileLink || "—"}</b>
+                  </span>
+                </div>
+              </details>
+            </div>
+          ) : (
+            <div className="empty-state">
+              <strong>暂无待处理达人。</strong>
+              <span>
+                {workbenchFilter
+                  ? "当前筛选下暂无待处理达人。"
+                  : "请导入达人数据，或切换到「全部产品」查看完整队列。"}
+              </span>
+            </div>
+          )}
+          {shouldShowReplyBlock && selectedTask && (
+            <section className="reply-panel" data-testid="reply-handling-panel">
+              <div className="section-heading">
+                <div>
+                  <h2>达人回复处理</h2>
+                  <p className="muted">
+                    默认只保留日常 BD 必填信息；高级策略字段已折叠。
+                  </p>
+                </div>
+              </div>
+              <div className="reply-two-column">
+                <div className="reply-column">
+                  <h3>达人回复</h3>
+                  <label>
+                    达人回复原文
+                    <textarea
+                      value={currentCreatorReply(selectedTask)}
+                      onChange={(event) =>
+                        updateCurrentCreatorReply(
+                          selectedTask,
+                          event.target.value,
+                        )
+                      }
+                      placeholder="可粘贴或手动修正达人原始回复"
+                      rows={4}
+                    />
+                  </label>
+                  <p className="muted compact-helper">
+                    可粘贴或手动修正达人原始回复，DeepSeek
+                    会基于这里的内容翻译和生成回复。
+                  </p>
+                  <label>
+                    处理备注 / 达人备注
+                    <textarea
+                      value={selectedTask.notes}
+                      onChange={(event) =>
+                        updateRow(selectedTask.id, "notes", event.target.value)
+                      }
+                      placeholder="例如：周末发布 / 回复慢，不要每天催 / 脚受伤，周五后再跟进 / 已沟通，等待剪辑 / 今天不催"
+                      rows={3}
+                    />
+                  </label>
+                  <div className="inline-actions deepseek-near-focus">
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() =>
+                        void callDeepSeek("generate_personalized_reply")
+                      }
+                      disabled={deepSeekLoadingAction !== null}
+                    >
+                      根据上方重点生成英文回复
+                    </button>
+                  </div>
+                  <div className="inline-actions">
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() =>
+                        void callDeepSeek("translate_creator_reply")
+                      }
+                      disabled={deepSeekLoadingAction !== null}
+                    >
+                      DeepSeek 翻译达人回复
+                    </button>
+                  </div>
+                  <div
+                    className={`translation-card ${isTranslationExpanded ? "expanded" : ""}`}
+                    data-testid="translation-card"
+                  >
+                    <div className="translation-card-header">
+                      <h3>中文翻译</h3>
+                      {deepSeekChineseTranslation && (
+                        <button
+                          type="button"
+                          className="link-button"
+                          onClick={() =>
+                            void copyText(
+                              deepSeekChineseTranslation,
+                              "已复制中文翻译。",
+                            )
+                          }
+                        >
+                          复制翻译
+                        </button>
+                      )}
+                    </div>
+                    {isTranslationEditing ? (
+                      <textarea
+                        aria-label="编辑中文翻译"
+                        value={deepSeekChineseTranslation}
+                        onChange={(event) =>
+                          setDeepSeekChineseTranslation(event.target.value)
+                        }
+                        rows={3}
+                      />
+                    ) : (
+                      <p className="translation-text">
+                        {deepSeekChineseTranslation ||
+                          "点击 DeepSeek 翻译达人回复后，这里只显示直译中文。"}
+                      </p>
+                    )}
+                    {deepSeekChineseTranslation && (
+                      <div className="inline-actions compact-actions">
+                        <button
+                          type="button"
+                          className="link-button"
+                          onClick={() =>
+                            setIsTranslationExpanded((value) => !value)
+                          }
+                        >
+                          {isTranslationExpanded ? "收起" : "展开全文"}
+                        </button>
+                        <button
+                          type="button"
+                          className="link-button"
+                          onClick={() =>
+                            setIsTranslationEditing((value) => !value)
+                          }
+                        >
+                          {isTranslationEditing ? "完成编辑" : "编辑翻译"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  {deepSeekLoadingAction === "translate_creator_reply" && (
+                    <p className="ai-status" role="status">
+                      DeepSeek 生成中…
+                    </p>
+                  )}
+                  {deepSeekError && (
+                    <p className="error" role="alert">
+                      {deepSeekError.includes("DEEPSEEK_API_KEY")
+                        ? "未配置 DEEPSEEK_API_KEY，无法调用 DeepSeek。"
+                        : "DeepSeek 调用失败，请检查 API Key 或稍后重试。"}
+                    </p>
+                  )}
+                </div>
+                <div className="reply-column">
+                  <h3>生成英文回复</h3>
+                  <label>
+                    我想回复的重点
+                    <textarea
+                      value={replyFocus}
+                      onChange={(event) => setReplyFocus(event.target.value)}
+                      placeholder="例如：表示理解，确认具体发布时间，方便安排投流"
+                      rows={3}
+                    />
+                  </label>
+                  <div className="inline-actions deepseek-near-focus">
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() =>
+                        void callDeepSeek("generate_personalized_reply")
+                      }
+                      disabled={deepSeekLoadingAction !== null}
+                    >
+                      根据上方重点生成英文回复
+                    </button>
+                  </div>
+                  <div className="reply-inline-fields">
+                    <p className="readonly-channel">当前联系渠道：{channel}</p>
+                    <label>
+                      回复语气
+                      <select
+                        value={replyTone}
+                        onChange={(event) =>
+                          setReplyTone(event.target.value as ReplyTone)
+                        }
+                      >
+                        <option>中立专业</option>
+                        <option>友好一点</option>
+                        <option>坚定推进</option>
+                        <option>最后确认</option>
+                      </select>
+                    </label>
+                  </div>
+                  <details
+                    className="advanced-reply-settings"
+                    open={isAdvancedReplyOpen}
+                    onToggle={(event) =>
+                      setIsAdvancedReplyOpen(event.currentTarget.open)
+                    }
+                  >
+                    <summary>高级设置</summary>
+                    <div className="reply-fields">
+                      <label>
+                        达人关系备注（可选）
+                        <textarea
+                          value={replyRelationshipNote}
+                          onChange={(event) =>
+                            setReplyRelationshipNote(event.target.value)
+                          }
+                          placeholder="例如：她之前视频质量不错 / 沟通比较慢"
+                        />
+                      </label>
+                      <label>
+                        这次回复目标（可选）
+                        <textarea
+                          value={replyGoal}
+                          onChange={(event) => setReplyGoal(event.target.value)}
+                          placeholder="例如：确认发布时间 / 推进剩余视频"
+                        />
+                      </label>
+                      <label>
+                        可接受让步（可选）
+                        <textarea
+                          value={replyConcession}
+                          onChange={(event) =>
+                            setReplyConcession(event.target.value)
+                          }
+                          placeholder="例如：可以周五发布 / 不能不挂车"
+                        />
+                      </label>
+                    </div>
+                  </details>
+                  <p className="muted compact-helper">
+                    默认先使用本地专业话术。DeepSeek
+                    仅用于复杂回复或需要个性化优化时。
+                  </p>
+                  <p className="muted compact-helper">
+                    DeepSeek 翻译只做直译；英文回复会把你的中文重点准确转成
+                    creator-facing English。
+                  </p>
+                  {message && (
+                    <div ref={messageAreaRef} className="message-output">
+                      <h3>场景 / 沟通动作</h3>
+                      <p>
+                        {message.scenario} · {message.communicationAction}
+                      </p>
+                      <h3>英文话术</h3>
+                      <p className="message-source-label">
+                        {messageSource === "deepseek"
+                          ? "DeepSeek 优化版"
+                          : "免费本地话术"}
+                      </p>
+                      <label
+                        className="sr-only"
+                        htmlFor="generated-english-message"
+                      >
+                        英文话术
+                      </label>
+                      <textarea
+                        id="generated-english-message"
+                        value={message.english}
+                        onChange={(event) =>
+                          updateGeneratedEnglishMessage(event.target.value)
+                        }
+                        rows={7}
+                      />
+                      {deepSeekLoadingAction ===
+                        "generate_personalized_reply" && (
+                        <p className="ai-status" role="status">
+                          DeepSeek 生成中…
+                        </p>
+                      )}
+                      <h3>中文对照 / 中文解释</h3>
+                      <span className="sr-only">中文解释</span>
+                      <p>
+                        {deepSeekChineseExplanation ||
+                          message.chineseExplanation}
+                      </p>
+                      <h3>发送后追踪</h3>
+                      <p>
+                        发送后请点击「标记为已发送」，系统会更新最近联系日期、跟进次数和下一次跟进日期。
+                      </p>
+                      <div className="inline-actions">
+                        <button
+                          type="button"
+                          onClick={() => void handleCopyGeneratedMessage()}
+                        >
+                          复制英文话术
+                        </button>
+                        <button type="button" onClick={handleMarkMessageSent}>
+                          标记为已发送
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={handleMarkCreatorReplied}
+                        >
+                          标记达人已回复
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={markCreatorNoReply}
+                        >
+                          标记未回复
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={markVideoProgress}
+                        >
+                          发布 1 条视频
+                        </button>
+                        <details className="advanced-actions">
+                          <summary>更多操作 / 高级操作</summary>
+                          <div className="inline-actions">
+                            <button
+                              type="button"
+                              className="secondary"
+                              onClick={handleManualVideoProgressUpdate}
+                            >
+                              手动更新视频进度
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary"
+                              onClick={() => markCreatorOutcome("Completed")}
+                            >
+                              合作完成
+                            </button>
+                            <button
+                              type="button"
+                              className="danger secondary"
+                              onClick={() => markCreatorOutcome("Failed")}
+                            >
+                              合作失败
+                            </button>
+                          </div>
+                        </details>
+                      </div>
+                      <div className="skip-today-control">
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={markCreatorSkippedToday}
+                        >
+                          今日暂不跟进
+                        </button>
+                      </div>
+                      {trackingStatus && (
+                        <p className="tracking-status">{trackingStatus}</p>
+                      )}
+                      {showNextCreatorPrompt && (
+                        <div className="next-creator-prompt">
+                          <strong>
+                            {lastProcessingResult || "已记录处理结果。"}
+                          </strong>
+                          <div className="inline-actions">
+                            <button
+                              type="button"
+                              onClick={handleProcessNextCreator}
+                              disabled={!nextTask}
+                            >
+                              处理下一个达人
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary"
+                              onClick={() => setShowNextCreatorPrompt(false)}
+                            >
+                              留在当前达人
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </section>
+          )}
+        </section>
+      </>
+    );
+  }
+
+  function renderCreatorDatabase() {
+    const allSelected =
+      filteredRows.length > 0 &&
+      filteredRows.every((entry) => selectedIds.includes(entry.row.id));
+    return (
+      <>
+        {renderPageHeader(
+          "达人数据库",
+          "管理达人信息、合作状态、物流状态、视频进度和跟进记录。",
+        )}
+        {renderImportCard()}
+        <section className="panel table-panel">
+          <div className="filters-bar">
+            <label>
+              搜索
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="搜索达人昵称 / 产品 / 状态"
+              />
+            </label>
+            <label>
+              合作状态
+              <select
+                value={statusFilter}
+                onChange={(event) =>
+                  setStatusFilter(event.target.value as CreatorStatus | "All")
+                }
+              >
+                <option value="All">全部</option>
+                {creatorStatuses.map((status) => (
+                  <option key={status} value={status}>
+                    {displayStatus(status)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              达人类型
+              <select
+                value={creatorTypeFilter}
+                onChange={(event) => setCreatorTypeFilter(event.target.value)}
+              >
+                <option value="All">全部</option>
+                <option>Pet</option>
+                <option>UGC</option>
+                <option>Grooming</option>
+              </select>
+            </label>
+            <label>
+              粉丝量级
+              <select
+                value={followerFilter}
+                onChange={(event) => setFollowerFilter(event.target.value)}
+              >
+                <option value="All">全部</option>
+                <option>K</option>
+                <option>M</option>
+                <option>—</option>
+              </select>
+            </label>
+            <label>
+              平均播放
+              <select
+                value={avgViewsFilter}
+                onChange={(event) => setAvgViewsFilter(event.target.value)}
+              >
+                <option value="All">全部</option>
+                <option>K</option>
+                <option>M</option>
+                <option>—</option>
+              </select>
+            </label>
+            <label>
+              GMV 区间
+              <select
+                value={gmvFilter}
+                onChange={(event) => setGmvFilter(event.target.value)}
+              >
+                <option value="All">全部</option>
+                <option>$</option>
+                <option value="low">低</option>
+                <option value="mid">中</option>
+                <option value="high">高</option>
+                <option>—</option>
+              </select>
+            </label>
+          </div>
+          <label className="checkbox-field">
+            <input
+              aria-label="显示已归档合作"
+              type="checkbox"
+              checked={showArchivedCollaborations}
+              onChange={(event) =>
+                setShowArchivedCollaborations(event.target.checked)
+              }
+            />
+            显示归档达人
+          </label>
+          {!showArchivedCollaborations && archivedProductCount > 0 && (
+            <p className="ai-status">
+              当前显示 active records，已隐藏 {archivedProductCount}{" "}
+              条已归档合作；开启“显示归档达人”可查看和搜索这些历史记录。默认 CSV
+              导出包含所有历史记录。
+            </p>
+          )}
+          <div className="sticky-action-bar">
+            <span>当前产品总记录：{productTotalCount}</span>
+            <span>当前显示：{filteredRows.length}</span>
+            <span>已选择：{selectedIds.length}</span>
+            <span>已归档合作：{archivedProductCount}</span>
+            <button
+              type="button"
+              className="secondary"
+              onClick={handleBulkCopyOutreach}
+              disabled={selectedIds.length === 0}
+            >
+              批量复制邀约话术
+            </button>
+            <select
+              value={bulkStatus}
+              onChange={(event) =>
+                setBulkStatus(event.target.value as CreatorStatus)
+              }
+            >
+              {creatorStatuses.map((status) => (
+                <option key={status} value={status}>
+                  {displayStatus(status)}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={handleBulkStatusUpdate}
+              disabled={selectedIds.length === 0}
+            >
+              批量更新状态
+            </button>
+          </div>
+          {filteredRows.length === 0 ? (
+            <div className="empty-state">
+              <strong>
+                {archivedSearchMatches.length > 0
+                  ? "该达人存在于已归档合作中，可开启显示已归档合作查看。"
+                  : "没有匹配的达人。"}
+              </strong>
+              <span>下一步：清空筛选、导入 CSV / Excel，或点击 新增达人。</span>
+            </div>
+          ) : (
+            <div className="table-wrap spreadsheet-wrap">
+              <table className="ops-table spreadsheet-table">
+                <thead>
+                  <tr>
+                    <th>
+                      <input
+                        aria-label="全选达人"
+                        type="checkbox"
+                        checked={allSelected}
+                        onChange={toggleSelectAll}
+                      />
+                    </th>
+                    <th>达人账号</th>
+                    <th>主页链接</th>
+                    <th>联系渠道</th>
+                    <th>店铺 / 品牌</th>
+                    <th>产品</th>
+                    <th>合作状态</th>
+                    <th>样品到货日期</th>
+                    <th>视频进度</th>
+                    <th>首条视频发布日期</th>
+                    <th>最近联系日期</th>
+                    <th>跟进次数</th>
+                    <th>跟进状态</th>
+                    <th>最近沟通动作</th>
+                    <th>最近沟通渠道</th>
+                    <th>下次跟进日期</th>
+                    <th>达人回复</th>
+                    <th>达人备注</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredRows.map((entry) => (
+                    <tr key={entry.row.id}>
+                      <td>
+                        <input
+                          aria-label={`选择 ${displayName(entry.row)}`}
+                          type="checkbox"
+                          checked={selectedIds.includes(entry.row.id)}
+                          onChange={() => toggleSelected(entry.row.id)}
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label="达人账号"
+                          value={entry.row.username}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "username",
+                              event.target.value,
+                            )
+                          }
+                        />
+                        {isArchivedCollaboration(entry.row) && <span className="mini-badge">已归档</span>}
+                        {getDuplicateCheck(entry.row, rows).multiSample && (
+                          <span className="mini-badge">同店铺多样品</span>
+                        )}
+                        {getDuplicateCheck(entry.row, rows)
+                          .crossStoreCreator && (
+                          <span className="mini-badge">跨店铺达人</span>
+                        )}
+                        {getDuplicateCheck(entry.row, rows)
+                          .possibleDuplicate && (
+                          <small className="warning-text">
+                            该达人在当前店铺的同一产品项目下可能已重复录入，建议检查是否需要合并。
+                          </small>
+                        )}
+                      </td>
+                      <td>
+                        <input
+                          aria-label="主页链接"
+                          value={entry.row.profileLink}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "profileLink",
+                              event.target.value,
+                            )
+                          }
+                          placeholder="@账号或主页链接"
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label="联系渠道"
+                          value={entry.row.contactMethod}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "contactMethod",
+                              event.target.value,
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label="店铺 / 品牌"
+                          value={entry.row.storeName || DEFAULT_STORE_NAME}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "storeName",
+                              event.target.value,
+                            )
+                          }
+                        />
+                        {getDuplicateCheck(entry.row, rows)
+                          .crossStoreCreator && (
+                          <span className="mini-badge">跨店铺达人</span>
+                        )}
+                      </td>
+                      <td>
+                        <input
+                          aria-label="产品名称"
+                          value={entry.row.product}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "product",
+                              event.target.value,
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label="合作状态"
+                          value={entry.row.currentStatus}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "currentStatus",
+                              event.target.value,
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label="样品到货日期"
+                          type="date"
+                          value={entry.row.sampleDeliveredDate}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "sampleDeliveredDate",
+                              event.target.value,
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label="视频进度"
+                          value={entry.row.videoProgress}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "videoProgress",
+                              event.target.value,
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label="首条视频发布日期"
+                          type="date"
+                          value={entry.row.firstVideoPostedDate}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "firstVideoPostedDate",
+                              event.target.value,
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label="最近联系日期"
+                          type="date"
+                          value={entry.row.lastContactDate}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "lastContactDate",
+                              event.target.value,
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label="跟进次数"
+                          type="number"
+                          min="0"
+                          value={entry.row.lastFollowUpCount}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "lastFollowUpCount",
+                              event.target.value,
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label="跟进状态"
+                          value={entry.row.trackingStatus ?? ""}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "trackingStatus",
+                              event.target.value,
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label="最近沟通动作"
+                          value={entry.row.lastMessageScenario ?? ""}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "lastMessageScenario",
+                              event.target.value,
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label="最近沟通渠道"
+                          value={entry.row.lastMessageChannel ?? ""}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "lastMessageChannel",
+                              event.target.value,
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          aria-label="下次跟进日期"
+                          type="date"
+                          value={entry.row.nextFollowUpDate ?? ""}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "nextFollowUpDate",
+                              event.target.value,
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <textarea
+                          aria-label="达人回复"
+                          value={entry.row.lastCreatorResponse ?? ""}
+                          onChange={(event) =>
+                            updateRow(
+                              entry.row.id,
+                              "lastCreatorResponse",
+                              event.target.value,
+                            )
+                          }
+                          rows={1}
+                        />
+                      </td>
+                      <td>
+                        <textarea
+                          aria-label="达人备注"
+                          value={entry.row.notes}
+                          onChange={(event) =>
+                            updateRow(entry.row.id, "notes", event.target.value)
+                          }
+                          rows={1}
+                        />
+                      </td>
+                      <td className="row-actions">
+                        <button
+                          type="button"
+                          className="secondary compact-button"
+                          onClick={() =>
+                            void copyText(
+                              buildOutreachForRow(entry.row),
+                              "已复制邀约话术。",
+                            )
+                          }
+                        >
+                          复制英文话术
+                        </button>
+                        <button
+                          type="button"
+                          className="danger secondary compact-button"
+                          onClick={() =>
+                            setRows((currentRows) =>
+                              deleteCreatorRow(currentRows, entry.row.id),
+                            )
+                          }
+                        >
+                          删除达人
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      </>
+    );
+  }
+
+  function applyTemplateToSelectedCreator() {
+    if (!selectedTemplateCreator) {
+      setToast({ tone: "warning", text: "请先选择达人。" });
+      return;
+    }
+    const creatorCampaign = campaignForRow(selectedTemplateCreator);
+    const creatorRequirements = campaignToFilmingRequirements(
+      creatorCampaign,
+      activeFilmingRequirements,
+    );
+    setTemplateForm((form) => ({
+      ...form,
+      creatorName: selectedTemplateCreator.username,
+      productName:
+        selectedTemplateCreator.product || creatorRequirements.productName,
+      sellingPoint: creatorCampaign?.sellingPoints || form.sellingPoint,
+      requirement: [
+        ...creatorRequirements.requirements,
+        ...creatorRequirements.keyContentPoints,
+      ]
+        .filter(Boolean)
+        .join("; "),
+      length: creatorCampaign?.videoLength || form.length,
+      videos:
+        creatorCampaign?.videoCount ||
+        String(parseRequiredVideos(creatorRequirements)),
+      tagRequirement: creatorCampaign?.tagRequirement || form.tagRequirement,
+      trackingNumber:
+        parseNumberFromNotes(selectedTemplateCreator.notes, [
+          "tracking",
+          "tracking number",
+        ]) === "—"
+          ? ""
+          : parseNumberFromNotes(selectedTemplateCreator.notes, [
+              "tracking",
+              "tracking number",
+            ]),
+      deadline: selectedTemplateCreator.nextFollowUpDate || "",
+    }));
+    setSelectedCreatorId(selectedTemplateCreator.id);
+    setToast({ tone: "success", text: "已套用当前达人和产品项目数据。" });
+  }
+
+  function markTemplateSent(template: TemplateMessage) {
+    if (!selectedTemplateCreator) {
+      setToast({ tone: "warning", text: "请先选择达人。" });
+      return;
+    }
+    markCreatorMessageSent(
+      selectedTemplateCreator.id,
+      template.name,
+      template.english,
+      channel,
+    );
+    setSelectedCreatorId(selectedTemplateCreator.id);
+    setTrackingStatus("已标记为发送，并同步更新数据表格。");
+    setToast({
+      tone: "success",
+      text: "模板已标记为已发送，并同步到达人跟进记录。",
+    });
+  }
+
+  function renderTemplates() {
+    return (
+      <>
+        {renderPageHeader(
+          "沟通话术模板",
+          "标准话术库：维护常用英文模板，可套用到具体达人，但不替代每日跟进队列。",
+        )}
+        <section className="panel template-selector-panel">
+          <div className="section-heading">
+            <div>
+              <h2>模板套用对象</h2>
+              <p className="muted">
+                选择达人后，模板会读取同一份达人数据库和产品项目要求。
+              </p>
+            </div>
+          </div>
+          <div className="generator-controls">
+            <label>
+              当前产品项目
+              <input
+                value={
+                  selectedCampaign === "ALL" ? "全部产品" : selectedCampaign
+                }
+                readOnly
+              />
+            </label>
+            <label>
+              选择达人
+              <select
+                aria-label="选择模板达人"
+                value={selectedTemplateCreator?.id ?? ""}
+                onChange={(event) => {
+                  setTemplateCreatorId(event.target.value);
+                  setSelectedCreatorId(event.target.value);
+                }}
+              >
+                <option value="">不选择达人，使用通用占位符</option>
+                {visibleRows.map((row) => (
+                  <option key={row.id} value={row.id}>
+                    {displayName(row)} · {row.product || "缺少产品名称"}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              联系渠道
+              <select
+                aria-label="模板联系渠道"
+                value={channel}
+                onChange={(event) => setChannel(event.target.value as Channel)}
+              >
+                {CHANNELS.map((item) => (
+                  <option key={item}>{item}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </section>
+        <section className="panel template-layout">
+          <div className="template-form">
+            {(Object.keys(templateForm) as Array<keyof TemplateForm>).map(
+              (key) => (
+                <label key={key}>
+                  {templateFieldLabels[key]}
+                  <input
+                    value={templateForm[key]}
+                    onChange={(event) =>
+                      setTemplateForm((form) => ({
+                        ...form,
+                        [key]: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+              ),
+            )}
+          </div>
+          <div className="template-results">
+            {templateMessages.map((template) => (
+              <article className="template-card" key={template.name}>
+                <h3>{template.name}</h3>
+                <h4>英文话术</h4>
+                <p>{template.english}</p>
+                <h4>中文对照</h4>
+                <p>{template.chinese}</p>
+                <div className="inline-actions">
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() =>
+                      void copyText(template.english, "英文话术已复制。")
+                    }
+                  >
+                    复制英文话术
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={applyTemplateToSelectedCreator}
+                    disabled={!selectedTemplateCreator}
+                  >
+                    应用到当前达人
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => markTemplateSent(template)}
+                    disabled={!selectedTemplateCreator}
+                  >
+                    标记为已发送
+                  </button>
+                </div>
+                {!selectedTemplateCreator && (
+                  <p className="muted">请先选择达人。</p>
+                )}
+              </article>
+            ))}
+          </div>
+        </section>
+      </>
+    );
+  }
+
+  function renderSamples() {
+    return (
+      <>
+        {renderPageHeader(
+          "样品追踪",
+          "围绕物流状态跟踪样品，自动提示卡点动作。",
+        )}
+        <section className="panel table-panel">
+          <div className="table-wrap">
+            <table className="ops-table">
+              <thead>
+                <tr>
+                  <th>达人名称</th>
+                  <th>产品名称</th>
+                  <th>样品状态</th>
+                  <th>物流商</th>
+                  <th>物流单号</th>
+                  <th>寄出日期</th>
+                  <th>签收日期</th>
+                  <th>签收后天数</th>
+                  <th>下一步跟进动作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleRows.map((row) => (
+                  <tr key={row.id}>
+                    <td>{displayName(row)}</td>
+                    <td>{row.product || "—"}</td>
+                    <td>
+                      <span
+                        className={statusTone(inferStatus(row, requiredVideos))}
+                      >
+                        {displayStatus(inferStatus(row, requiredVideos))}
+                      </span>
+                    </td>
+                    <td>{parseNumberFromNotes(row.notes, ["carrier"])}</td>
+                    <td>
+                      {parseNumberFromNotes(row.notes, [
+                        "tracking",
+                        "tracking number",
+                      ])}
+                    </td>
+                    <td>{parseNumberFromNotes(row.notes, ["shipped date"])}</td>
+                    <td>{row.sampleDeliveredDate || "—"}</td>
+                    <td>{daysDelivered(row) ?? "—"}</td>
+                    <td>{sampleHint(row, requiredVideos)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </>
+    );
+  }
+
+  function renderFollowup() {
+    return renderDashboard();
+  }
+
+  function reviewChecklistForRow(row: CreatorRow) {
+    const requirements = campaignToFilmingRequirements(
+      campaignForRow(row),
+      activeFilmingRequirements,
+    );
+    return [
+      `是否展示必须展示内容：${requirements.requiredScenes || "按 Campaign 配置"}`,
+      `是否体现产品卖点：${requirements.sellingPoints || "按 Campaign 配置"}`,
+      `是否满足视频时长要求：${requirements.videoLength || "按 Campaign 配置"}`,
+      `是否满足视频数量要求：${requirements.videoCount || "按 Campaign 配置"}`,
+      `是否避免“不希望达人这样拍”的内容：${requirements.avoidShots || "按 Campaign 配置"}`,
+      `是否挂 TikTok Shop 产品链接：${requirements.productLinkRequirement || "按 Campaign 配置"}`,
+      `是否参考了正确的视频方向：${requirements.referenceVideoLinks || "按 Campaign 配置"}`,
+    ];
+  }
+
+  function renderReview() {
+    return (
+      <>
+        {renderPageHeader(
+          "内容审核",
+          "逐条验收达人视频，输出可执行的验收状态。",
+        )}
+        <section className="panel review-grid">
+          {visibleRows.map((row) => (
+            <article className="review-card" key={row.id}>
+              <div>
+                <h3>{displayName(row)}</h3>
+                <span className={statusTone(inferStatus(row, requiredVideos))}>
+                  {displayStatus(inferStatus(row, requiredVideos))}
+                </span>
+              </div>
+              {reviewChecklistForRow(row).map((item) => (
+                <label key={item} className="check-row">
+                  <input type="checkbox" />
+                  {item}
+                </label>
+              ))}
+              <select defaultValue="Approved">
+                <option value="Approved">审核通过</option>
+                <option value="Need Revision">需要修改</option>
+                <option value="Product Tag Missing">未挂商品卡</option>
+                <option value="Not Usable for Ads">不可投流</option>
+                <option value="Ready for Ads">可投流</option>
+              </select>
+            </article>
+          ))}
+        </section>
+      </>
+    );
+  }
+
+  function renderAds() {
+    const tags = [
+      "爪部清洁",
+      "遛后护理",
+      "猫咪互动",
+      "狗狗梳毛",
+      "产品演示",
+      "前后对比",
+      "UGC 口碑",
+      "高 CTR 潜力",
+    ];
+    return (
+      <>
+        {renderPageHeader(
+          "投流素材库",
+          "沉淀可投流 UGC 视频，管理 Spark Ads 和素材授权。",
+        )}
+        <section className="panel table-panel">
+          <div className="tag-cloud">
+            {tags.map((tag) => (
+              <span key={tag}>{tag}</span>
+            ))}
+          </div>
+          <div className="table-wrap">
+            <table className="ops-table">
+              <thead>
+                <tr>
+                  <th>达人名称</th>
+                  <th>产品名称</th>
+                  <th>视频链接</th>
+                  <th>Hook 角度</th>
+                  <th>宠物类型</th>
+                  <th>使用场景</th>
+                  <th>视频时长</th>
+                  <th>自然播放量</th>
+                  <th>互动表现</th>
+                  <th>转化潜力</th>
+                  <th>Spark Ads 状态</th>
+                  <th>素材授权状态</th>
+                  <th>达人备注</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleRows
+                  .filter((row) =>
+                    ["Ready for Ads", "Spark Ads Requested", "Posted"].includes(
+                      inferStatus(row, requiredVideos),
+                    ),
+                  )
+                  .map((row) => (
+                    <tr key={row.id}>
+                      <td>{displayName(row)}</td>
+                      <td>{row.product}</td>
+                      <td>
+                        {parseNumberFromNotes(row.notes, ["video url", "url"])}
+                      </td>
+                      <td>{parseNumberFromNotes(row.notes, ["hook"])}</td>
+                      <td>{parseNumberFromNotes(row.notes, ["pet type"])}</td>
+                      <td>{parseNumberFromNotes(row.notes, ["scene"])}</td>
+                      <td>{parseNumberFromNotes(row.notes, ["length"])}</td>
+                      <td>{parseNumberFromNotes(row.notes, ["views"])}</td>
+                      <td>{parseNumberFromNotes(row.notes, ["engagement"])}</td>
+                      <td>{parseNumberFromNotes(row.notes, ["potential"])}</td>
+                      <td>
+                        {inferStatus(row, requiredVideos) ===
+                        "Spark Ads Requested"
+                          ? "已申请"
+                          : "未申请"}
+                      </td>
+                      <td>{parseNumberFromNotes(row.notes, ["rights"])}</td>
+                      <td>{row.notes || "—"}</td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </>
+    );
+  }
+
+  function renderSettings() {
+    const targetCampaign =
+      activeCampaign ?? activeCampaigns[0] ?? mergedCampaigns[0];
+    const targetCampaignIdentity = targetCampaign
+      ? campaignOptionValue(targetCampaign)
+      : "";
+    const updateCampaign = (patch: Partial<Campaign>) => {
+      if (!targetCampaign) return;
+      setCampaigns(
+        mergedCampaigns.map((campaign) =>
+          campaignOptionValue(campaign) === targetCampaignIdentity
+            ? { ...campaign, ...patch }
+            : campaign,
+        ),
+      );
+    };
+    const duplicateProductInStore = (
+      campaign: Campaign,
+      productName: string,
+      storeId = normalizeStoreId(campaign.storeId, campaign.storeName),
+    ) =>
+      mergedCampaigns.some(
+        (item) =>
+          campaignOptionValue(item) !== campaignOptionValue(campaign) &&
+          normalizeStoreId(item.storeId, item.storeName) === storeId &&
+          item.productName.trim().toLowerCase() ===
+            productName.trim().toLowerCase(),
+      );
+    const updateCampaignProductName = (
+      campaign: Campaign,
+      productName: string,
+    ) => {
+      if (duplicateProductInStore(campaign, productName)) {
+        setToast({
+          tone: "warning",
+          text: "当前店铺下已存在同名产品，请换一个产品名称。",
+        });
+        return;
+      }
+      updateCampaign({ productName, id: campaignIdFromName(productName) });
+    };
+    const campaignFieldsDiffer = (source: Campaign, target: Campaign) => {
+      const serialize = (value: unknown) =>
+        Array.isArray(value)
+          ? value.join("\n").trim()
+          : String(value ?? "").trim();
+      return (
+        [
+          "sellingPoints",
+          "requirements",
+          "keyContentPoints",
+          "avoidShots",
+          "videoCount",
+          "videoLength",
+          "tagRequirement",
+          "productLink",
+          "referenceLinks",
+          "defaultMessageSetting",
+          "notes",
+        ] as const
+      ).some(
+        (field) =>
+          serialize(source[field]) &&
+          serialize(target[field]) &&
+          serialize(source[field]) !== serialize(target[field]),
+      );
+    };
+    const mergeMissingCampaignConfig = (
+      source: Campaign,
+      target: Campaign,
+    ): Campaign => {
+      const next = { ...target };
+      (
+        [
+          "sellingPoints",
+          "avoidShots",
+          "videoCount",
+          "videoLength",
+          "tagRequirement",
+          "productLink",
+          "defaultMessageSetting",
+          "notes",
+        ] as const
+      ).forEach((field) => {
+        if (
+          !String(next[field] ?? "").trim() &&
+          String(source[field] ?? "").trim()
+        )
+          next[field] = source[field] as never;
+      });
+      (["requirements", "keyContentPoints", "referenceLinks"] as const).forEach(
+        (field) => {
+          if (
+            (next[field] ?? []).length === 0 &&
+            (source[field] ?? []).length > 0
+          )
+            next[field] = source[field] as never;
+        },
+      );
+      return next;
+    };
+    const moveRowsToCampaign = (source: Campaign, target: Campaign) => {
+      const movedRows = rows.filter((row) => rowMatchesCampaign(row, source));
+      setRows(
+        rows.map((row) =>
+          rowMatchesCampaign(row, source)
+            ? {
+                ...row,
+                storeId: normalizeStoreId(target.storeId, target.storeName),
+                storeName: normalizeStoreName(target.storeName),
+                campaignId: target.id,
+                product: target.productName,
+              }
+            : row,
+        ),
+      );
+      return movedRows.length;
+    };
+    const assignCampaignStore = (campaign: Campaign, nextStoreId: string) => {
+      const nextStore = stores.find((store) => store.id === nextStoreId);
+      if (!nextStore) return;
+      const targetDuplicate = mergedCampaigns.find(
+        (item) =>
+          campaignOptionValue(item) !== campaignOptionValue(campaign) &&
+          normalizeStoreId(item.storeId, item.storeName) === nextStore.id &&
+          item.productName.trim().toLowerCase() ===
+            campaign.productName.trim().toLowerCase(),
+      );
+      if (targetDuplicate) {
+        if (
+          !window.confirm(
+            "目标店铺下已存在同名产品。是否将当前产品及其达人记录合并到目标产品？",
+          )
+        )
+          return;
+        const movedCount = moveRowsToCampaign(campaign, targetDuplicate);
+        const hasConfigDiff = campaignFieldsDiffer(campaign, targetDuplicate);
+        setCampaigns(
+          mergedCampaigns.map((item) => {
+            if (
+              campaignOptionValue(item) === campaignOptionValue(targetDuplicate)
+            )
+              return mergeMissingCampaignConfig(campaign, targetDuplicate);
+            if (campaignOptionValue(item) === campaignOptionValue(campaign))
+              return { ...item, archivedAt: todayString() };
+            return item;
+          }),
+        );
+        setSelectedStore(nextStore.id);
+        setSelectedCampaign(campaignOptionValue(targetDuplicate));
+        setToast({
+          tone: hasConfigDiff ? "warning" : "success",
+          text: `已将 ${movedCount} 条达人记录合并到 ${nextStore.name} · ${targetDuplicate.productName}。${hasConfigDiff ? "两个产品配置存在不同拍摄要求，已保留目标产品配置，请手动检查。" : ""}`,
+        });
+        return;
+      }
+      const movedCount = moveRowsToCampaign(campaign, {
+        ...campaign,
+        storeId: nextStore.id,
+        storeName: nextStore.name,
+      });
+      updateCampaign({ storeId: nextStore.id, storeName: nextStore.name });
+      setSelectedStore(nextStore.id);
+      setToast({
+        tone: "success",
+        text: `已将产品关联到所选店铺 / 品牌，并迁移 ${movedCount} 条达人记录。`,
+      });
+    };
+    const createCampaign = () => {
+      const productName = window.prompt("产品 / Campaign 名称：", "")?.trim();
+      if (!productName) return;
+      let targetStore =
+        selectedStore === ALL_STORES
+          ? undefined
+          : stores.find((store) => store.id === selectedStore);
+      if (!targetStore) {
+        const storeName = window
+          .prompt(
+            "请选择该产品所属店铺 / 品牌（输入现有店铺名称）：",
+            stores[0]?.name ?? DEFAULT_STORE_NAME,
+          )
+          ?.trim();
+        targetStore = stores.find(
+          (store) => store.name.toLowerCase() === storeName?.toLowerCase(),
+        );
+      }
+      if (!targetStore) {
+        setToast({
+          tone: "warning",
+          text: "创建产品前必须选择已有店铺 / 品牌。",
+        });
+        return;
+      }
+      if (
+        mergedCampaigns.some(
+          (campaign) =>
+            normalizeStoreId(campaign.storeId, campaign.storeName) ===
+              targetStore.id &&
+            campaign.productName.trim().toLowerCase() ===
+              productName.toLowerCase(),
+        )
+      ) {
+        setToast({
+          tone: "warning",
+          text: "当前店铺下已存在同名产品，请换一个产品名称。",
+        });
+        return;
+      }
+      const nextCampaign = createCampaignFromName(
+        productName,
+        filmingRequirements,
+        targetStore.name,
+        targetStore.id,
+      );
+      setCampaigns([...mergedCampaigns, nextCampaign]);
+      setSelectedStore(targetStore.id);
+      setSelectedCampaign(campaignOptionValue(nextCampaign));
+      setToast({
+        tone: "success",
+        text: "已新增产品项目，并关联到当前店铺 / 品牌。",
+      });
+    };
+    const linkedRowsCount = (campaign: Campaign) =>
+      rows.filter((row) => rowMatchesCampaign(row, campaign)).length;
+    const syncCampaignVideoCount = (campaign: Campaign) => {
+      const latestCampaign =
+        mergedCampaigns.find((item) => item.id === campaign.id) ?? campaign;
+      const targetRequiredVideos = campaignRequiredVideoCount(
+        latestCampaign,
+        activeFilmingRequirements,
+      );
+      let updatedCount = 0;
+      let preservedPublishedCount = 0;
+      let skippedCount = 0;
+      const nextRows = rows.map((row) => {
+        if (!rowMatchesCampaign(row, latestCampaign)) return row;
+        const progress = normalizeVideoProgress(
+          row.videoProgress,
+          targetRequiredVideos,
+        );
+        const postedFromText = row.videoProgress.match(
+          /^\s*(\d+)\s*(?:\/|of)\s*\d+/i,
+        )?.[1];
+        const postedCount =
+          typeof progress.postedCount === "number"
+            ? progress.postedCount
+            : postedFromText
+              ? Number.parseInt(postedFromText, 10)
+              : undefined;
+        if (typeof postedCount !== "number" || !Number.isFinite(postedCount)) {
+          skippedCount += 1;
+          return row;
+        }
+        if (postedCount > 0) preservedPublishedCount += 1;
+        const nextProgress = `${postedCount}/${targetRequiredVideos}`;
+        if (row.videoProgress === nextProgress && !row.videoProgressWarning)
+          return row;
+        updatedCount += 1;
+        const normalized = normalizeVideoProgress(
+          nextProgress,
+          targetRequiredVideos,
+        );
+        return {
+          ...row,
+          videoProgress: normalized.normalized,
+          videoProgressWarning: normalized.warning,
+        };
+      });
+      setRows(nextRows);
+      setToast({
+        tone: skippedCount > 0 ? "warning" : "success",
+        text: `目标视频数量：${targetRequiredVideos}；已同步 ${updatedCount} 条达人记录；保留 ${preservedPublishedCount} 条已有发布进度；跳过 ${skippedCount} 条需要手动检查。`,
+      });
+    };
+    const duplicateCampaign = (campaign: Campaign) => {
+      const copy = {
+        ...campaign,
+        id: `${campaign.id}-copy-${Date.now()}`,
+        productName: `${campaign.productName} Copy`,
+        archivedAt: undefined,
+      };
+      setCampaigns([...mergedCampaigns, copy]);
+      setToast({ tone: "success", text: "已复制产品项目。" });
+    };
+    const archiveCampaign = (campaign: Campaign) => {
+      setCampaigns(
+        mergedCampaigns.map((item) =>
+          item.id === campaign.id
+            ? { ...item, archivedAt: todayString() }
+            : item,
+        ),
+      );
+      setToast({
+        tone: "success",
+        text: "已归档产品，历史达人记录和导出数据会保留。",
+      });
+    };
+    const restoreCampaign = (campaign: Campaign) => {
+      setCampaigns(
+        mergedCampaigns.map((item) =>
+          item.id === campaign.id ? { ...item, archivedAt: undefined } : item,
+        ),
+      );
+      setToast({ tone: "success", text: "已恢复产品。" });
+    };
+    const deleteCampaign = (campaign: Campaign) => {
+      const linked = linkedRowsCount(campaign);
+      if (linked > 0) {
+        setToast({
+          tone: "warning",
+          text: `该产品已关联 ${linked} 条达人记录，直接删除可能导致历史数据丢失。建议归档该产品。`,
+        });
+        return;
+      }
+      setCampaigns(mergedCampaigns.filter((item) => item.id !== campaign.id));
+      setToast({ tone: "success", text: "该产品暂无关联数据，可以安全删除。" });
+    };
+    return (
+      <>
+        {renderPageHeader(
+          "设置",
+          "管理产品项目、拍摄要求、提示词助手和本地数据。",
+        )}
+        <section className="panel sop-card">
+          <div className="section-heading">
+            <div>
+              <h2>产品项目设置</h2>
+              <p className="muted">
+                达人拍摄要求是 Campaign 核心配置。每个产品项目独立保存 8
+                个拍摄要求字段，供工作台、话术、DeepSeek 和内容审核调用。
+              </p>
+            </div>
+          </div>
+          <label className="campaign-picker">
+            选择产品 / Campaign
+            <select
+              value={
+                targetCampaign
+                  ? campaignSelectValue(targetCampaign, activeCampaigns)
+                  : ""
+              }
+              onChange={(event) => setSelectedCampaign(event.target.value)}
+            >
+              {activeCampaigns.map((campaign) => (
+                <option
+                  key={campaignOptionValue(campaign)}
+                  value={campaignSelectValue(campaign, activeCampaigns)}
+                >
+                  {campaignLabel(campaign, showStoreLabels)}
+                  {campaign.archivedAt ? "（已归档）" : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="checkbox-field">
+            <input
+              type="checkbox"
+              checked={showArchivedProducts}
+              onChange={(event) =>
+                setShowArchivedProducts(event.target.checked)
+              }
+            />
+            显示已归档产品
+          </label>
+          {targetCampaign && (
+            <div className="inline-actions campaign-actions">
+              <button
+                type="button"
+                className="secondary"
+                onClick={createCampaign}
+              >
+                新增产品
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() =>
+                  setToast({
+                    tone: "success",
+                    text: "可直接在下方编辑产品字段。",
+                  })
+                }
+              >
+                编辑
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => duplicateCampaign(targetCampaign)}
+              >
+                复制
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => archiveCampaign(targetCampaign)}
+              >
+                归档
+              </button>
+              {targetCampaign.archivedAt && (
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => restoreCampaign(targetCampaign)}
+                >
+                  恢复
+                </button>
+              )}
+              <button
+                type="button"
+                className="danger secondary"
+                onClick={() => deleteCampaign(targetCampaign)}
+              >
+                删除
+              </button>
+            </div>
+          )}
+          {targetCampaign && (
+            <div
+              className="settings-form campaign-settings"
+              data-testid="campaign-settings-form"
+            >
+              <label>
+                店铺 / 品牌
+                <select
+                  value={normalizeStoreId(
+                    targetCampaign.storeId,
+                    targetCampaign.storeName,
+                  )}
+                  onChange={(event) =>
+                    assignCampaignStore(targetCampaign, event.target.value)
+                  }
+                >
+                  {stores.map((store) => (
+                    <option key={store.id} value={store.id}>
+                      {store.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                产品名称
+                <input
+                  value={targetCampaign.productName}
+                  onChange={(event) =>
+                    updateCampaignProductName(
+                      targetCampaign,
+                      event.target.value,
+                    )
+                  }
+                />
+              </label>
+              <label>
+                必须展示内容
+                <textarea
+                  value={listToText(targetCampaign.keyContentPoints)}
+                  onChange={(event) =>
+                    updateCampaign({
+                      keyContentPoints: normalizeListText(event.target.value),
+                    })
+                  }
+                  rows={5}
+                />
+              </label>
+              <label>
+                产品卖点
+                <textarea
+                  aria-label="Campaign 产品卖点"
+                  value={targetCampaign.sellingPoints}
+                  onChange={(event) =>
+                    updateCampaign({ sellingPoints: event.target.value })
+                  }
+                  rows={3}
+                />
+              </label>
+              <label>
+                视频时长要求
+                <input
+                  value={targetCampaign.videoLength}
+                  onChange={(event) =>
+                    updateCampaign({ videoLength: event.target.value })
+                  }
+                />
+              </label>
+              <label>
+                视频数量要求
+                <input
+                  value={targetCampaign.videoCount}
+                  onChange={(event) =>
+                    updateCampaign({ videoCount: event.target.value })
+                  }
+                />
+              </label>
+              <div className="inline-actions">
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => syncCampaignVideoCount(targetCampaign)}
+                >
+                  同步视频数量到达人记录
+                </button>
+                <span className="muted">
+                  会更新 0/2 → 0/1 等安全记录，并保留已发布视频数量。
+                </span>
+              </div>
+              <label>
+                不希望达人这样拍
+                <textarea
+                  value={targetCampaign.avoidShots}
+                  onChange={(event) =>
+                    updateCampaign({ avoidShots: event.target.value })
+                  }
+                  rows={3}
+                />
+              </label>
+              <label>
+                挂车 / TikTok Shop 产品链接要求
+                <textarea
+                  value={[
+                    targetCampaign.tagRequirement,
+                    targetCampaign.productLink,
+                  ]
+                    .filter(Boolean)
+                    .join("\n")}
+                  onChange={(event) =>
+                    updateCampaign({
+                      tagRequirement: event.target.value,
+                      productLink: "",
+                    })
+                  }
+                  rows={3}
+                />
+              </label>
+              <label>
+                参考视频链接
+                <textarea
+                  value={listToText(targetCampaign.referenceLinks)}
+                  onChange={(event) =>
+                    updateCampaign({
+                      referenceLinks: normalizeListText(event.target.value),
+                    })
+                  }
+                  rows={3}
+                />
+              </label>
+              <p className="ai-status">
+                产品项目设置会自动保存到 localStorage，并作为当前 Campaign
+                拍摄要求的唯一配置来源。
+              </p>
+            </div>
+          )}
+        </section>
+        <section className="panel sop-card">
+          <div className="section-heading">
+            <div>
+              <h2>店铺清理</h2>
+              <p className="muted">
+                空的错别字店铺会在产品归档后从顶部下拉中隐藏；仍有关联产品或达人记录的店铺需要先迁移或合并。
+              </p>
+            </div>
+          </div>
+          <div className="inline-actions">
+            {stores.map((store) => {
+              const linkedCampaigns = mergedCampaigns.filter(
+                (campaign) =>
+                  normalizeStoreId(campaign.storeId, campaign.storeName) ===
+                    store.id && !campaign.archivedAt,
+              ).length;
+              const linkedRows = rows.filter(
+                (row) => rowStoreId(row) === store.id,
+              ).length;
+              const canDeleteStore = linkedCampaigns === 0 && linkedRows === 0;
+              return (
+                <button
+                  key={store.id}
+                  type="button"
+                  className="secondary"
+                  onClick={() =>
+                    setToast(
+                      canDeleteStore
+                        ? {
+                            tone: "success",
+                            text: `${store.name} 已无关联产品或达人记录，会从店铺下拉中隐藏。`,
+                          }
+                        : {
+                            tone: "warning",
+                            text: "该店铺仍有关联产品或达人记录，请先迁移或合并后再删除。",
+                          },
+                    )
+                  }
+                >
+                  {canDeleteStore
+                    ? `隐藏空店铺：${store.name}`
+                    : `检查店铺：${store.name}`}
+                </button>
+              );
+            })}
+          </div>
+        </section>
+        <section className="panel prompt-helper">
+          <div className="section-heading">
+            <div>
+              <h2>用 ChatGPT 辅助生成拍摄要求（可选）</h2>
+              <p className="muted">
+                只生成可复制提示词；不会调用 API，也不会自动修改数据。
+              </p>
+            </div>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() =>
+                isPromptHelperOpen
+                  ? setIsPromptHelperOpen(false)
+                  : handleOpenPromptHelper()
+              }
+            >
+              {isPromptHelperOpen ? "收起辅助生成" : "展开辅助生成"}
+            </button>
+          </div>
+          {isPromptHelperOpen && (
+            <div className="settings-form">
+              <label>
+                产品卖点
+                <input
+                  value={promptHelperForm.sellingPoints}
+                  onChange={(event) =>
+                    setPromptHelperForm((form) => ({
+                      ...form,
+                      sellingPoints: event.target.value,
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                单条视频时长要求
+                <input
+                  value={promptHelperForm.durationRequirement}
+                  onChange={(event) =>
+                    setPromptHelperForm((form) => ({
+                      ...form,
+                      durationRequirement: event.target.value,
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                对标视频链接（可选，每行一个）
+                <textarea
+                  value={promptHelperForm.referenceLinks}
+                  onChange={(event) =>
+                    setPromptHelperForm((form) => ({
+                      ...form,
+                      referenceLinks: event.target.value,
+                    }))
+                  }
+                />
+              </label>
+              <button
+                type="button"
+                onClick={() => {
+                  setGeneratedChatGptPrompt(buildChatGptPrompt());
+                  setPromptCopyStatus("");
+                }}
+              >
+                生成可复制提示词
+              </button>
+              {generatedChatGptPrompt && (
+                <>
+                  <p className="ai-status">
+                    提示词已生成。请复制到 ChatGPT 使用。
+                  </p>
+                  <label>
+                    ChatGPT 提示词
+                    <textarea
+                      value={generatedChatGptPrompt}
+                      readOnly
+                      rows={8}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void copyText(
+                        generatedChatGptPrompt,
+                        "已复制提示词。",
+                      ).then(() => setPromptCopyStatus("已复制提示词。"))
+                    }
+                  >
+                    复制提示词
+                  </button>
+                  {promptCopyStatus && (
+                    <p className="ai-status">{promptCopyStatus}</p>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </section>
+        <section className="panel danger-zone">
+          <div className="section-heading">
+            <div>
+              <h2>危险操作</h2>
+              <p className="muted">
+                仅清空当前浏览器 localStorage 中的达人数据，不影响产品项目设置。
+              </p>
+            </div>
+            <button
+              type="button"
+              className="secondary danger"
+              onClick={() => {
+                clearSavedCreatorRows();
+                setRows([]);
+                setToast({ tone: "success", text: "已清空本地达人数据。" });
+              }}
+            >
+              清空当前数据
+            </button>
+          </div>
+        </section>
+      </>
+    );
+  }
+
+  function renderActiveModule() {
+    if (activeModule === "dashboard") return renderDashboard();
+    if (activeModule === "creators") return renderCreatorDatabase();
+    if (activeModule === "templates") return renderTemplates();
+    if (activeModule === "samples") return renderSamples();
+    if (activeModule === "followup") return renderFollowup();
+    if (activeModule === "review") return renderReview();
+    if (activeModule === "ads") return renderAds();
+    return renderSettings();
+  }
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <span>TT</span>
+          <div>
+            <strong>Creator SOP</strong>
+            <small>运营工作台</small>
+          </div>
+        </div>
+        <nav aria-label="主导航">
+          {navItems.map((item) => (
+            <button
+              type="button"
+              key={item.key}
+              className={activeModule === item.key ? "active" : ""}
+              onClick={() => setActiveModule(item.key)}
+            >
+              <i>{navIcons[item.key]}</i>
+              <span>{item.label}</span>
+              <small>{item.helper}</small>
+            </button>
+          ))}
+        </nav>
+      </aside>
+      <main className="workspace">
+        {renderCampaignSelector()}
+        {renderActiveModule()}
+      </main>
+      {toast && (
+        <div className={`toast ${toast.tone}`} role="status">
+          {toast.text}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
