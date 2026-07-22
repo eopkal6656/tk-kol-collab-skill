@@ -111,18 +111,8 @@ The uploaded spreadsheet should include:
 * Current status
 * Sample shipping status
 * Video progress
-* Last contact date
+* Video link
 * Notes
-
-Video progress can be entered as `0/2`, `1/2`, or `2/2`.
-
-Spreadsheet software may auto-convert values like `1/2` into a date, so users can also use safer formats such as:
-
-* `1 of 2`
-* `0 of 2`
-* `2 of 2`
-* `1 video`
-* `posted 1`
 
 The system should generate:
 
